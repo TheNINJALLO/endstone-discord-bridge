@@ -20,8 +20,9 @@
 </p>
 
 <p align="center">
-  <a href="#overview">Overview</a> &bull;
-  <a href="#compatibility">Compatibility</a> &bull;
+  <a href="#what-it-does">What it does</a> &bull;
+  <a href="#how-to-use">How to use</a> &bull;
+  <a href="#commands-and-permissions">Commands</a> &bull;
   <a href="#install">Install</a> &bull;
   <a href="https://github.com/TheNINJALLO/endstone-discord-bridge/releases">Releases</a>
 </p>
@@ -30,9 +31,25 @@
 
 Endstone ↔ Discord bridge. This release is aligned with Endstone 0.11.8 and Minecraft Bedrock Dedicated Server 1.26.40, and is distributed as a Python wheel for direct installation in an Endstone server.
 
-## Capabilities
+## What it does
 
--
+- Relays Minecraft chat and server activity to Discord and supports Discord-to-server messaging.
+- Links Minecraft and Discord identities, routes queued commands, and can report grief/economy/activity events.
+- Offers Discord slash-command administration plus two focused in-game commands.
+
+## How to use
+
+1. Copy the example configuration to the plugin data folder and provide the bot token, guild ID, and channel/role IDs only in that local runtime file.
+2. Invite the bot with the required Discord permissions, start Endstone, and confirm that slash commands synchronize.
+3. A player runs `/link`, then completes the generated code with `/verify` in Discord.
+4. After editing the runtime configuration, use `/bridgereload`; rotate any token that has ever been exposed.
+
+## Commands and permissions
+
+| Command / usage | What it does | Access |
+|---|---|---|
+| `/link` | Generate a code to link your Discord account (/verify in Discord). | `endstone_discord_bridge.link` |
+| `/bridgereload` | Reload the Discord bridge config from disk. | `endstone_discord_bridge.reload` |
 
 ## Compatibility
 

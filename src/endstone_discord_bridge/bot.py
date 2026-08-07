@@ -194,6 +194,37 @@ class DiscordBot(commands.Bot):
 
     # ---------------- Discord -> MC relay ----------------
     async def on_message(self, message: discord.Message):
+        # --- Bridge relay channel: child bot messages ---
+        bridge_relay_id = int(self.plugin_config.channels.bridge_relay or 0)
+        if bridge_relay_id and message.channel.id == bridge_relay_id and message.author.bot:
+            # Check for RELAY embed from a child bot
+            if message.embeds:
+                e = message.embeds[0]
+                if e.footer and e.footer.text and e.footer.text.startswith("RELAY"):
+                    server_name = (e.author.name or "?") if e.author else "?"
+                    
+                    # Ignore messages originating from this main server to prevent echo loops
+                    my_server_name = self.plugin_config.relay_hub.server_name
+                    if server_name == my_server_name or server_name == "Discord":
+                        return
+                    
+                    player = (e.title or "?")
+                    body = (e.description or "")
+                    
+                    footer_text = e.footer.text.strip()
+                    if footer_text == "RELAY_JOIN":
+                        if hasattr(self.plugin, "on_child_join_discord"):
+                            self.plugin.on_child_join_discord(server_name, player)
+                    elif footer_text in ("RELAY_LEAVE", "RELAY_QUIT"):
+                        if hasattr(self.plugin, "on_child_quit_discord"):
+                            self.plugin.on_child_quit_discord(server_name, player)
+                    else:
+                        if body:
+                            # Broadcast to local MC
+                            if self.plugin.on_child_chat_discord:
+                                self.plugin.on_child_chat_discord(server_name, player, body)
+            return
+
         if message.author.bot:
             return
 
@@ -239,6 +270,28 @@ class DiscordBot(commands.Bot):
             except Exception as e:
                 self.logger.error(f"Failed to relay Discord message to server: {e}")
         self.plugin.sync.run_fire_and_forget(send_to_mc)
+
+        # Relay Discord user chat to bridge_relay channel for child servers
+        if bridge_relay_id:
+            try:
+                ch = self.get_channel(bridge_relay_id) or await self.fetch_channel(bridge_relay_id)
+                if ch:
+                    embed = discord.Embed(
+                        title=message.author.display_name,
+                        description=content,
+                        color=0x5865F2,
+                    )
+                    embed.set_author(name="Discord")
+                    embed.set_footer(text="RELAY")
+                    await ch.send(embed=embed)
+            except Exception as e:
+                self.logger.debug(f"Failed to relay Discord chat to bridge_relay: {e}")
+
+        # Relay Discord user chat to child servers via WebSocket relay hub
+        if self.plugin.relay_hub:
+            self.plugin.relay_hub.broadcast_to_children(
+                {"type": "chat", "server": "Discord", "player": message.author.display_name, "message": content}
+            )
 
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         if not self.plugin_config.features.relay_edits:

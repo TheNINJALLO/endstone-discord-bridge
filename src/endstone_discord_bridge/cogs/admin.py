@@ -4,7 +4,7 @@ from typing import Optional
 import discord
 from discord import app_commands
 
-from ..util import MinecraftCogBase, admin_only
+from ..util import MinecraftCogBase, admin_only, allowlist_admin_only
 
 
 class AdminCommands(MinecraftCogBase):
@@ -125,7 +125,7 @@ class AdminCommands(MinecraftCogBase):
                self.server.dispatch_command(cs, f"whitelist {subcmd}")
 
     @app_commands.command(name="allowlist_add", description="Add a player to the allowlist/whitelist.")
-    @admin_only()
+    @allowlist_admin_only()
     async def allowlist_add(self, interaction: discord.Interaction, player: str):
         await self.safe_defer(interaction, ephemeral=True)
         ok = await self._run_on_server_thread(lambda: self._allow_or_white(f"add {player}"))
@@ -133,7 +133,7 @@ class AdminCommands(MinecraftCogBase):
         await interaction.followup.send("✅ Added." if ok else "⚠️ Failed.", ephemeral=True)
 
     @app_commands.command(name="allowlist_remove", description="Remove a player from the allowlist/whitelist.")
-    @admin_only()
+    @allowlist_admin_only()
     async def allowlist_remove(self, interaction: discord.Interaction, player: str):
         await self.safe_defer(interaction, ephemeral=True)
         ok = await self._run_on_server_thread(lambda: self._allow_or_white(f"remove {player}"))

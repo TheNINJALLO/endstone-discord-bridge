@@ -1,4 +1,3 @@
-
 import asyncio
 import string
 import threading
@@ -29,26 +28,42 @@ from .bot import DiscordBot
 from .util import SyncRunner, translate_component
 from .activity_tracker import ActivityTracker
 from .grief_tracker import GriefTracker
+from .relay_hub import RelayHub
 
 
 class DiscordBridgePlugin(Plugin):
-    api_version = "0.10"
+    api_version = "0.11"
 
     @property
     def config(self) -> BridgeConfig:  # type: ignore[override]
         return self._cfg
+
+    def _format_lang(self, template: str, **kwargs) -> str:
+        class SafeDict(dict):
+            def __missing__(self, key):
+                return f"{{{key}}}"
+        return template.format_map(SafeDict(**kwargs))
 
     commands = {
         "link": {
             "description": "Generate a code to link your Discord account (/verify in Discord).",
             "usages": ["/link"],
             "permissions": ["endstone_discord_bridge.link"],
+        },
+        "bridgereload": {
+            "description": "Reload the Discord bridge config from disk.",
+            "usages": ["/bridgereload"],
+            "permissions": ["endstone_discord_bridge.reload"],
         }
     }
 
     permissions = {
         "endstone_discord_bridge.link": {
             "description": "Allow players to use /link to link Discord.",
+            "default": True,
+        },
+        "endstone_discord_bridge.reload": {
+            "description": "Reload the bridge config file.",
             "default": True,
         }
     }
@@ -105,13 +120,38 @@ class DiscordBridgePlugin(Plugin):
         self.bot_thread: Optional[threading.Thread] = None
         self.bot: Optional[DiscordBot] = None
 
+        # Relay hub for multi-server chat (WebSocket — optional)
+        self.relay_hub: Optional[RelayHub] = None
+        if self._cfg.relay_hub.enabled:
+            rh = self._cfg.relay_hub
+            self.relay_hub = RelayHub(
+                port=rh.port,
+                secret=rh.secret,
+                server_name=rh.server_name,
+                logger=self.logger,
+            )
+            self.relay_hub.on_child_chat = self._on_child_chat
+            self.relay_hub.on_child_connect = self._on_child_connect
+            self.relay_hub.on_child_disconnect = self._on_child_disconnect
+            self.relay_hub.start()
+
+        # Discord relay callback (set by bot.py on_message)
+        self.on_child_chat_discord = self._handle_child_chat_discord
+
         self.start_bot_thread()
         self.register_events(self)
         self.logger.info("Discord bridge enabled.")
-        self._relay("🟢 **Server started**")
+        self._relay("\U0001f7e2 **Server started**")
 
     def on_disable(self) -> None:
         self.logger.info("Shutting down Discord bridge…")
+        # Stop relay hub
+        if self.relay_hub:
+            try:
+                self.relay_hub.stop()
+            except Exception:
+                pass
+            self.relay_hub = None
         # Removed shutdown message to Discord as it hangs during server shutdown
         try:
             if self.bot and self.bot.loop and self.bot.loop.is_running():
@@ -157,6 +197,161 @@ class DiscordBridgePlugin(Plugin):
         """Send a simple message to the relay channel with retry logic"""
         self._queue_simple_message(text, "relay", "system")
 
+    # ---------- relay hub callbacks (called from WS thread) ----------
+    def _on_child_chat(self, server_name: str, player: str, message: str):
+        """Child server sent a chat message. Relay to: local MC, Discord, other children."""
+        # Broadcast to local MC (must happen on main thread)
+        def _mc_broadcast():
+            try:
+                self.server.broadcast_message(f"[§b{server_name}§r] <{player}> {message}")
+            except Exception as e:
+                self.logger.error(f"Failed to relay child chat to MC: {e}")
+        self.server.scheduler.run_task(self, _mc_broadcast, delay=0)
+
+        # Send to Discord
+        self._queue_child_discord_message(server_name, player, message)
+
+        # Relay to other child servers via Discord bridge_relay channel
+        if self._cfg.channels.bridge_relay:
+            self._post_to_bridge_relay(server_name, player, message)
+
+        # Forward to all other children
+        if self.relay_hub:
+            self.relay_hub.broadcast_to_children(
+                {"type": "chat", "server": server_name, "player": player, "message": message},
+                exclude_server=server_name,
+            )
+
+    def _on_child_connect(self, server_name: str):
+        """Child server connected."""
+        self._relay(f"🔗 **{server_name}** connected to relay hub")
+
+    def _on_child_disconnect(self, server_name: str):
+        """Child server disconnected."""
+        self._relay(f"\U0001F50C **{server_name}** disconnected from relay hub")
+
+    def _handle_child_chat_discord(self, server_name: str, player: str, message: str):
+        """Called by bot.py when it detects a child relay embed in the bridge_relay channel."""
+        # Broadcast to local MC (must happen on main thread)
+        def _mc_broadcast():
+            try:
+                self.server.broadcast_message(f"[\u00a7b{server_name}\u00a7r] <{player}> {message}")
+            except Exception as e:
+                self.logger.error(f"Failed to relay child chat to MC: {e}")
+        self.server.scheduler.run_task(self, _mc_broadcast, delay=0)
+
+        # Send to the user-facing relay channel on Discord
+        self._queue_child_discord_message(server_name, player, message)
+
+        # Forward to child servers connected via WebSocket relay hub
+        if self.relay_hub:
+            self.relay_hub.broadcast_to_children(
+                {"type": "chat", "server": server_name, "player": player, "message": message},
+                exclude_server=server_name,
+            )
+
+    def on_child_join_discord(self, server_name: str, player: str):
+        """Called by bot.py when it detects a child relay join event in the bridge_relay channel."""
+        # Format the text with the dynamic replacement logic
+        template = self.config.lang.join
+        if "{server}" in template:
+            text = self._format_lang(template, name=player, server=server_name)
+        else:
+            text = self._format_lang(template, name=player)
+            if "the server" in text:
+                text = text.replace("the server", server_name)
+            else:
+                text += f" ({server_name})"
+
+        # Send to the main relay channel on Discord
+        self._queue_child_join_leave_message(player, text, 0x2ECC71)
+
+    def on_child_quit_discord(self, server_name: str, player: str):
+        """Called by bot.py when it detects a child relay leave event in the bridge_relay channel."""
+        # Format the text with the dynamic replacement logic
+        template = self.config.lang.quit
+        if "{server}" in template:
+            text = self._format_lang(template, name=player, server=server_name)
+        else:
+            text = self._format_lang(template, name=player)
+            if "the server" in text:
+                text = text.replace("the server", server_name)
+            else:
+                text += f" ({server_name})"
+
+        # Send to the main relay channel on Discord
+        self._queue_child_join_leave_message(player, text, 0xF59E0B)
+
+    def _post_to_bridge_relay(self, server_name: str, player: str, message: str):
+        """Post a structured RELAY embed to the bridge_relay channel for child bots."""
+        async def _send():
+            try:
+                if self.bot and self.bot.loop and not self.bot.loop.is_closed():
+                    await self.bot.wait_until_ready()
+                    ch_id = int(self._cfg.channels.bridge_relay or 0)
+                    if not ch_id:
+                        return
+                    ch = self.bot.get_channel(ch_id)
+                    if ch is None:
+                        ch = await self.bot.fetch_channel(ch_id)
+                    if ch:
+                        embed = discord.Embed(
+                            title=player,
+                            description=message,
+                            color=0x57F287,
+                        )
+                        embed.set_author(name=server_name)
+                        embed.set_footer(text="RELAY")
+                        await ch.send(embed=embed)
+            except Exception as e:
+                self.logger.debug(f"Failed to post to bridge_relay: {e}")
+
+        if self.bot and self.bot.loop and not self.bot.loop.is_closed():
+            asyncio.run_coroutine_threadsafe(_send(), self.bot.loop)
+
+    def _queue_child_discord_message(self, server_name: str, player: str, message: str):
+        """Send a child server's chat message to Discord with the server name tag."""
+        async def send_with_retry():
+            max_retries = 3
+            retry_delay = 1.0
+            for attempt in range(max_retries):
+                try:
+                    if self.bot and self.bot.loop and not self.bot.loop.is_closed():
+                        await self.bot.wait_until_ready()
+                        description = message
+                        embed = discord.Embed(description=description, color=0x3498DB)
+                        embed.set_author(name=f"[{server_name}] {player}")
+                        # Try webhook first
+                        if self.config.features.webhook_mode and self.config.discord.webhook_url:
+                            try:
+                                success = await self.bot.send_via_webhook(
+                                    username=f"[{server_name}] {player}",
+                                    text=None,
+                                    embed=embed,
+                                )
+                                if success:
+                                    return
+                            except Exception:
+                                pass
+                        # Fallback to channel
+                        ch = await self.bot._resolve_named_channel("relay")
+                        if ch:
+                            await ch.send(embed=embed)
+                            return
+                        else:
+                            raise Exception("Could not resolve relay channel")
+                    else:
+                        raise Exception("Bot not ready")
+                except Exception as e:
+                    self.logger.warning(f"Child relay attempt {attempt+1}/{max_retries} failed: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay * (2 ** attempt))
+                    else:
+                        self.logger.error(f"Failed to relay child chat to Discord after {max_retries} attempts")
+
+        if self.bot and self.bot.loop and not self.bot.loop.is_closed():
+            asyncio.run_coroutine_threadsafe(send_with_retry(), self.bot.loop)
+
     # ---------- helpers ----------
     def _generate_link_code(self) -> str:
         alphabet = string.ascii_uppercase + string.digits
@@ -186,7 +381,11 @@ class DiscordBridgePlugin(Plugin):
             coords = None
         return world, coords
 
-    def _minotar(self, name: str) -> str:
+    def _minotar(self, name: str, xuid: Optional[str] = None) -> str:
+        # If XUID is provided, use Microsoft's API for player head
+        if xuid:
+            return f"https://persona-secondary.franchise.minecraft-services.net/api/v1.0/profile/xuid/{xuid}/image/head"
+        # Fallback to configured avatar template (e.g., Minotar)
         # URL-encode the name to handle spaces and special characters
         encoded_name = quote(name, safe='')
         return (self.config.discord.webhook_avatar_template or "").format(name=encoded_name)
@@ -271,6 +470,8 @@ class DiscordBridgePlugin(Plugin):
 
     # ---------- /link ----------
     def on_command(self, sender: CommandSender, command: Command, args: list[str]) -> bool:
+        if command.name == "bridgereload":
+            return self._cmd_reload(sender)
         if command.name != "link":
             return False
         if isinstance(sender, Player):
@@ -288,6 +489,23 @@ class DiscordBridgePlugin(Plugin):
             sender.send_message("Run this command in-game.")
         return True
 
+    def _cmd_reload(self, sender: CommandSender) -> bool:
+        """Reload config.toml from disk without restarting the server."""
+        if isinstance(sender, Player) and not sender.is_op:
+            sender.send_message("§cYou must be an operator to use this command.")
+            return True
+        try:
+            cfg_path = self.data_folder / "config.toml"
+            self._cfg = BridgeConfig.load(cfg_path)
+            if self.bot:
+                self.bot.plugin_config = self._cfg
+            sender.send_message("§aBridge config reloaded from disk.")
+            self.logger.info(f"Config reloaded by {getattr(sender, 'name', 'console')}")
+        except Exception as e:
+            sender.send_message(f"§cReload failed: {e}")
+            self.logger.error(f"Config reload failed: {e}")
+        return True
+
     # ---------- Events (MC → Discord embeds) ----------
     @event_handler
     def on_player_chat(self, event: PlayerChatEvent):
@@ -300,15 +518,17 @@ class DiscordBridgePlugin(Plugin):
                 except Exception:
                     pass
             try:
-                event.player.send_message(" §7You are currently muted.§r")
+                event.player.send_message(" §7You are currently muted.§r")
             except Exception:
                 pass
             return
         msg = translate_component(self.server, event.message)
         name = event.player.name
+        xuid = event.player.xuid
 
-        # Filter out SuperEnchants commands (anything starting with -op) from Discord relay
-        if msg.strip().startswith("-op"):
+        # Filter out in-game command prefixes (- and ;) from Discord relay
+        stripped = msg.strip()
+        if stripped.startswith("-") or stripped.startswith(";"):
             return
 
         route = "relay"
@@ -320,12 +540,26 @@ class DiscordBridgePlugin(Plugin):
             route = "trade"; msg = msg[len(pref_trade):].lstrip()
 
         # Always attempt to send, even if bot isn't ready yet - queue it up
-        self._queue_discord_message(name, msg, route, "chat")
+        self._queue_discord_message(name, msg, route, "chat", xuid)
+
+        # Relay to child servers via Discord bridge_relay channel
+        if route == "relay" and self._cfg.channels.bridge_relay:
+            self._post_to_bridge_relay(
+                self._cfg.relay_hub.server_name, name, msg
+            )
+
+        # Relay to child servers via WebSocket relay hub
+        if route == "relay" and self.relay_hub:
+            self.relay_hub.broadcast_to_children(
+                {"type": "chat", "server": self.config.relay_hub.server_name, "player": name, "message": msg}
+            )
 
     @event_handler
     def on_player_join(self, event: PlayerJoinEvent):
         name = event.player.name
-        text = self.config.lang.join.format(name=name)
+        xuid = event.player.xuid
+        server_name = self.config.relay_hub.server_name
+        text = self._format_lang(self.config.lang.join, name=name, server=server_name)
         world, coords = self._world_and_coords(event.player)
 
         # Track activity
@@ -338,14 +572,16 @@ class DiscordBridgePlugin(Plugin):
         )
 
         # Always attempt to send join messages, even if bot isn't ready yet
-        self._queue_join_leave_message(name, text, world, coords, "join", 0x3BA55C)
+        self._queue_join_leave_message(name, text, world, coords, "join", 0x3BA55C, xuid)
         self._flush_score_ops_for(event.player)
         self._flush_command_ops_for(event.player)
 
     @event_handler
     def on_player_quit(self, event: PlayerQuitEvent):
         name = event.player.name
-        text = self.config.lang.quit.format(name=name)
+        xuid = event.player.xuid
+        server_name = self.config.relay_hub.server_name
+        text = self._format_lang(self.config.lang.quit, name=name, server=server_name)
         world, coords = self._world_and_coords(event.player)
 
         # Track activity
@@ -358,20 +594,23 @@ class DiscordBridgePlugin(Plugin):
         )
 
         # Always attempt to send quit messages, even if bot isn't ready yet
-        self._queue_join_leave_message(name, text, world, coords, "quit", 0xF59E0B)
+        self._queue_join_leave_message(name, text, world, coords, "quit", 0xF59E0B, xuid)
 
     @event_handler
     def on_player_death(self, event: PlayerDeathEvent):
         localized = translate_component(self.server, event.death_message)
-        text = self.config.lang.death.format(message=localized)
         name = getattr(getattr(event, "player", None), "name", "Player")
+        server_name = self.config.relay_hub.server_name
+        text = self._format_lang(self.config.lang.death, message=localized, name=name, server=server_name)
+        xuid = None
         try:
             world, coords = self._world_and_coords(event.player)  # type: ignore
+            xuid = event.player.xuid  # type: ignore
         except Exception:
             world, coords = None, None
 
         # Always attempt to send death messages, even if bot isn't ready yet
-        self._queue_join_leave_message(name, text, world, coords, "death", 0xED4245)
+        self._queue_join_leave_message(name, text, world, coords, "death", 0xED4245, xuid)
 
     @event_handler
     def on_player_command(self, event: PlayerCommandEvent):
@@ -408,8 +647,8 @@ class DiscordBridgePlugin(Plugin):
 
             # Get tool used if available
             tool_used = None
-            if hasattr(player, 'inventory') and hasattr(player.inventory, 'item_in_hand'):
-                item = player.inventory.item_in_hand
+            if hasattr(player, 'inventory'):
+                item = player.inventory.item_in_main_hand
                 if item and hasattr(item, 'type'):
                     tool_used = getattr(item.type, 'name', str(item.type))
 
@@ -466,14 +705,14 @@ class DiscordBridgePlugin(Plugin):
 
             # Get item used from player's inventory
             item_used = None
-            if hasattr(player, 'inventory') and hasattr(player.inventory, 'item_in_hand'):
-                item = player.inventory.item_in_hand
+            if hasattr(player, 'inventory'):
+                item = player.inventory.item_in_main_hand
                 if item and hasattr(item, 'type'):
                     item_used = getattr(item.type, 'name', str(item.type))
 
             # Get item used if not already set
-            if not item_used and hasattr(player, 'inventory') and hasattr(player.inventory, 'item_in_hand'):
-                item = player.inventory.item_in_hand
+            if not item_used and hasattr(player, 'inventory'):
+                item = player.inventory.item_in_main_hand
                 if item and hasattr(item, 'type'):
                     item_used = getattr(item.type, 'name', str(item.type))
 
@@ -559,7 +798,7 @@ class DiscordBridgePlugin(Plugin):
         except Exception as e:
             self.logger.error(f"Error tracking container access event: {e}")
 
-    def _queue_discord_message(self, name: str, msg: str, route: str, msg_type: str = "chat"):
+    def _queue_discord_message(self, name: str, msg: str, route: str, msg_type: str = "chat", xuid: Optional[str] = None):
         """Queue a message to be sent to Discord with retry logic"""
         async def send_with_retry():
             max_retries = 3
@@ -571,8 +810,8 @@ class DiscordBridgePlugin(Plugin):
                     if self.bot and self.bot.loop and not self.bot.loop.is_closed():
                         await self.bot.wait_until_ready()
 
-                        avatar = self._minotar(name)
-                        description = f"**{name}**\n{msg}"
+                        avatar = self._minotar(name, xuid)
+                        description = msg
                         embed = discord.Embed(description=description, color=0x57F287)
                         embed.set_author(name=name, icon_url=avatar)
 
@@ -615,7 +854,7 @@ class DiscordBridgePlugin(Plugin):
         else:
             self.logger.warning(f"Cannot queue {msg_type} message for {name} - bot not available: {msg[:50]}...")
 
-    def _queue_join_leave_message(self, name: str, text: str, world: Optional[str], coords: Optional[str], event_type: str, color: int):
+    def _queue_join_leave_message(self, name: str, text: str, world: Optional[str], coords: Optional[str], event_type: str, color: int, xuid: Optional[str] = None):
         """Queue a join/leave message to be sent to Discord with retry logic"""
         async def send_with_retry():
             max_retries = 3
@@ -627,7 +866,7 @@ class DiscordBridgePlugin(Plugin):
                     if self.bot and self.bot.loop and not self.bot.loop.is_closed():
                         await self.bot.wait_until_ready()
 
-                        avatar = self._minotar(name)
+                        avatar = self._minotar(name, xuid)
 
                         # Send to rich channel (join/quit specific)
                         try:
@@ -706,3 +945,39 @@ class DiscordBridgePlugin(Plugin):
             asyncio.run_coroutine_threadsafe(send_with_retry(), self.bot.loop)
         else:
             self.logger.warning(f"Cannot queue {msg_type} message - bot not available: {message[:50]}...")
+
+    def _queue_child_join_leave_message(self, name: str, text: str, color: int):
+        """Queue a child server join/leave message to be sent to Discord with retry logic"""
+        async def send_with_retry():
+            max_retries = 3
+            retry_delay = 1.0
+
+            for attempt in range(max_retries):
+                try:
+                    if self.bot and self.bot.loop and not self.bot.loop.is_closed():
+                        await self.bot.wait_until_ready()
+
+                        avatar = self._minotar(name, None)
+
+                        ch_relay = await self.bot._resolve_named_channel("relay")
+                        if ch_relay:
+                            embed = discord.Embed(description=text, color=color)
+                            embed.set_author(name=name, icon_url=avatar)
+                            embed.timestamp = discord.utils.utcnow()
+                            await ch_relay.send(embed=embed)
+                            self.logger.debug(f"Child join/leave message sent to relay channel: {name}")
+                        return
+                    else:
+                        raise Exception("Bot not ready or loop closed")
+
+                except Exception as e:
+                    self.logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to send child join/leave message for {name}: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay * (2 ** attempt))
+                    else:
+                        self.logger.error(f"Failed to send child join/leave message for {name} after {max_retries} attempts")
+
+        if self.bot and self.bot.loop and not self.bot.loop.is_closed():
+            asyncio.run_coroutine_threadsafe(send_with_retry(), self.bot.loop)
+        else:
+            self.logger.warning(f"Cannot queue child join/leave message for {name} - bot not available")

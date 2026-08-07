@@ -1,11 +1,12 @@
 [project]
 name = "endstone-discord-bridge"
-version = "5.1.3"
+version = "5.4.3"
 description = "Endstone ↔ Discord bridge"
 requires-python = ">=3.10"
 dependencies = [
-  "endstone",
+  "endstone>=0.11.8,<0.12",
   "discord.py>=2.3.0",
+  "websockets>=12.0",
 ]
 
 # 👇 entry point name must be lowercase hyphenated to match distro name rules

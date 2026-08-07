@@ -829,6 +829,127 @@ class ActivityCommands(MinecraftCogBase):
 
         return "\n".join(lines)
 
+    @app_commands.command(name="inactivity_summary", description="View summary of inactive members for 7, 14, and 30 days")
+    @admin_only()
+    @app_commands.describe(
+        platform="Filter by platform (optional)"
+    )
+    async def inactivity_summary(
+        self,
+        interaction: discord.Interaction,
+        platform: Literal["discord", "minecraft", "both"] = "both"
+    ):
+        """Show a summary of inactive members across different time periods (7, 14, 30 days)"""
+        await self.safe_defer(interaction, ephemeral=True)
+
+        try:
+            activity_tracker = self.plugin.activity_tracker
+
+            # Get member data for 90 days to capture all inactive members
+            member_data = activity_tracker.get_comprehensive_member_list(90)
+            # Combine active and inactive members to get all members
+            all_members = member_data.get('active_members', []) + member_data.get('inactive_members', [])
+
+            # Calculate inactive counts for each threshold
+            thresholds = [7, 14, 30]
+            inactive_counts = {t: {'total': 0, 'discord': 0, 'minecraft': 0, 'linked': 0, 'members': []} for t in thresholds}
+
+            for member in all_members:
+                days_inactive = member.get('days_since_last_activity', 0)
+
+                # Apply platform filter
+                if platform == "discord" and not member.get('discord_username'):
+                    continue
+                elif platform == "minecraft" and not member.get('minecraft_username'):
+                    continue
+
+                for threshold in thresholds:
+                    if days_inactive >= threshold:
+                        inactive_counts[threshold]['total'] += 1
+                        if member.get('is_linked'):
+                            inactive_counts[threshold]['linked'] += 1
+                        elif member.get('discord_username') and not member.get('minecraft_username'):
+                            inactive_counts[threshold]['discord'] += 1
+                        elif member.get('minecraft_username') and not member.get('discord_username'):
+                            inactive_counts[threshold]['minecraft'] += 1
+                        inactive_counts[threshold]['members'].append(member)
+
+            embed = self._create_inactivity_summary_embed(inactive_counts, platform, member_data['total_members'])
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            self.plugin.logger.error(f"Error generating inactivity summary: {e}")
+            await interaction.followup.send(
+                "❌ Failed to generate inactivity summary. Check server logs for details.",
+                ephemeral=True
+            )
+
+    def _create_inactivity_summary_embed(self, inactive_counts: dict, platform: str, total_members: int) -> discord.Embed:
+        """Create embed showing inactivity summary for 7, 14, and 30 days"""
+        embed = discord.Embed(
+            title="😴 Inactivity Summary",
+            description=f"Overview of inactive members across different time periods\n**Platform Filter:** {platform.title()}",
+            color=0xFF6B6B,
+            timestamp=discord.utils.utcnow()
+        )
+
+        # Summary table
+        summary_lines = []
+        for days in [7, 14, 30]:
+            data = inactive_counts[days]
+            pct = (data['total'] / max(total_members, 1)) * 100
+            summary_lines.append(f"**{days} days:** {data['total']:,} members ({pct:.1f}%)")
+
+        embed.add_field(
+            name="📊 Inactive Member Counts",
+            value="\n".join(summary_lines),
+            inline=False
+        )
+
+        # Detailed breakdown for each threshold
+        for days in [7, 14, 30]:
+            data = inactive_counts[days]
+            breakdown = (
+                f"🔗 Linked: {data['linked']}\n"
+                f"💬 Discord Only: {data['discord']}\n"
+                f"⛏️ Minecraft Only: {data['minecraft']}"
+            )
+            embed.add_field(
+                name=f"📅 {days}+ Days Inactive",
+                value=breakdown,
+                inline=True
+            )
+
+        # Show top 10 most inactive members (30+ days)
+        most_inactive = sorted(
+            inactive_counts[30]['members'],
+            key=lambda m: m.get('days_since_last_activity', 0),
+            reverse=True
+        )[:10]
+
+        if most_inactive:
+            member_list = []
+            for i, member in enumerate(most_inactive, 1):
+                name = member.get('discord_username') or member.get('minecraft_username') or 'Unknown'
+                days_ago = member.get('days_since_last_activity', 0)
+                status = "🔗" if member.get('is_linked') else ("💬" if member.get('discord_username') else "⛏️")
+                member_list.append(f"{i}. {status} **{name}** - {days_ago}d")
+
+            embed.add_field(
+                name="🏆 Most Inactive (30+ days)",
+                value="\n".join(member_list),
+                inline=False
+            )
+
+        embed.add_field(
+            name="ℹ️ Legend",
+            value="🔗 Linked | 💬 Discord Only | ⛏️ Minecraft Only",
+            inline=False
+        )
+
+        embed.set_footer(text="Use /inactive_members <days> for detailed list | /export_inactive for bulk export")
+        return embed
+
     @app_commands.command(name="unified_activity", description="View unified activity report showing linked accounts together")
     @admin_only()
     @app_commands.describe(

@@ -50,6 +50,30 @@ def admin_only(permission_msg: str = "❌ You need an admin role or Server Admin
     return decorator
 
 
+def allowlist_admin_only(permission_msg: str = "❌ You need an admin/allowlist role or Server Admin to use this."):
+    """Slash command check: allow Discord admins, admin_role_ids, or allowlist_role_ids."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            raise app_commands.CheckFailure(permission_msg)
+        if interaction.user.guild_permissions.administrator:
+            return True
+        bot = interaction.client  # our DiscordBot
+        discord_cfg = getattr(getattr(bot, "plugin_config", None), "discord", None)
+        if discord_cfg:
+            admin_roles = getattr(discord_cfg, "admin_role_ids", []) or []
+            allowlist_roles = getattr(discord_cfg, "allowlist_role_ids", []) or []
+            allowed_ids = set(admin_roles) | set(allowlist_roles)
+            if any(r.id in allowed_ids for r in interaction.user.roles):
+                return True
+        raise app_commands.CheckFailure(permission_msg)
+
+    def decorator(func):
+        return app_commands.check(predicate)(func)
+
+    return decorator
+
+
+
 class MinecraftCogBase(commands.Cog):
     def __init__(self, bot: commands.Bot):
         super().__init__()

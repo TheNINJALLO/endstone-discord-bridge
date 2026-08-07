@@ -10,6 +10,7 @@ class DiscordSection:
     token: str = ""
     guild_id: int = 0
     admin_role_ids: list[int] = field(default_factory=lambda: [0])
+    allowlist_role_ids: list[int] = field(default_factory=lambda: [0])
     dev_guild_id: int = 0
     webhook_url: str = ""
     webhook_avatar_template: str = "https://minotar.net/avatar/{name}.png"
@@ -55,6 +56,7 @@ class ChannelsSection:
     grief_block_break: int = 0  # NEW: grief monitoring - block breaks
     grief_block_place: int = 0  # NEW: grief monitoring - block places
     grief_container: int = 0    # NEW: grief monitoring - container access
+    bridge_relay: int = 0       # Inter-server relay channel (Discord transport)
 
     def to_names(self) -> dict[str, int]:
         return {
@@ -69,6 +71,7 @@ class ChannelsSection:
             "grief_block_break": self.grief_block_break,  # NEW
             "grief_block_place": self.grief_block_place,  # NEW
             "grief_container": self.grief_container,      # NEW
+            "bridge_relay": self.bridge_relay,
         }
 
 
@@ -147,6 +150,14 @@ class GriefMonitoringSection:
 
 
 @dataclass
+class RelayHubSection:
+    enabled: bool = False
+    port: int = 8765
+    secret: str = "change-me-shared-secret"
+    server_name: str = "Main Server"
+
+
+@dataclass
 class LangSection:
     join: str = "➡️ {name} joined the server."
     quit: str = "⬅️ {name} left the server."
@@ -165,6 +176,7 @@ class BridgeConfig:
     economy: EconomySection = field(default_factory=EconomySection)
     activity: ActivitySection = field(default_factory=ActivitySection)
     grief_monitoring: GriefMonitoringSection = field(default_factory=GriefMonitoringSection)
+    relay_hub: RelayHubSection = field(default_factory=RelayHubSection)
     lang: LangSection = field(default_factory=LangSection)
 
     @staticmethod
@@ -195,6 +207,7 @@ class BridgeConfig:
             economy=as_section(EconomySection, "economy"),
             activity=as_section(ActivitySection, "activity"),
             grief_monitoring=as_section(GriefMonitoringSection, "grief_monitoring"),
+            relay_hub=as_section(RelayHubSection, "relay_hub"),
             lang=as_section(LangSection, "lang"),
         )
         return cfg

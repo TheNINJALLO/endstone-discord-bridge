@@ -46,6 +46,9 @@ Endstone ↔ Discord bridge. This release is aligned with Endstone 0.11.9 and Mi
 
 ## Commands and permissions
 
+For complete syntax, options, examples, and access rules, see the
+[dedicated command guide](docs/commands.md).
+
 | Command / usage | What it does | Access |
 |---|---|---|
 | `/link` | Generate a code to link your Discord account (/verify in Discord). | `endstone_discord_bridge.link` |

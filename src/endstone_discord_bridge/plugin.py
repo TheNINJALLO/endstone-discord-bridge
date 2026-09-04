@@ -22,7 +22,7 @@ from endstone.event import (
 )
 from endstone import Player
 
-from .config_schema import BridgeConfig
+from .config_schema import BridgeConfig, is_bridge_relay_enabled
 from .linked_store import LinkedStore
 from .bot import DiscordBot
 from .util import SyncRunner, translate_component
@@ -193,9 +193,24 @@ class DiscordBridgePlugin(Plugin):
         except Exception as e:
             self.logger.error(f"Failed saving linked store: {e}")
 
+    def reload_config_from_disk(self) -> BridgeConfig:
+        """Reload config and update components that retain a config reference."""
+        self._cfg = BridgeConfig.load(self.data_folder / "config.toml")
+        if self.bot:
+            self.bot.plugin_config = self._cfg
+        if getattr(self, "activity_tracker", None):
+            self.activity_tracker.config = self._cfg
+        if getattr(self, "grief_tracker", None):
+            self.grief_tracker.config = self._cfg.grief_monitoring
+        return self._cfg
+
     def _relay(self, text: str) -> None:
         """Send a simple message to the relay channel with retry logic"""
         self._queue_simple_message(text, "relay", "system")
+
+    def _bridge_relay_enabled(self) -> bool:
+        """Return whether the Discord-channel multi-server bridge is configured."""
+        return is_bridge_relay_enabled(self.config)
 
     # ---------- relay hub callbacks (called from WS thread) ----------
     def _on_child_chat(self, server_name: str, player: str, message: str):
@@ -212,7 +227,7 @@ class DiscordBridgePlugin(Plugin):
         self._queue_child_discord_message(server_name, player, message)
 
         # Relay to other child servers via Discord bridge_relay channel
-        if self._cfg.channels.bridge_relay:
+        if self._bridge_relay_enabled():
             self._post_to_bridge_relay(server_name, player, message)
 
         # Forward to all other children
@@ -284,6 +299,9 @@ class DiscordBridgePlugin(Plugin):
 
     def _post_to_bridge_relay(self, server_name: str, player: str, message: str):
         """Post a structured RELAY embed to the bridge_relay channel for child bots."""
+        if not self._bridge_relay_enabled():
+            return
+
         async def _send():
             try:
                 if self.bot and self.bot.loop and not self.bot.loop.is_closed():
@@ -495,10 +513,7 @@ class DiscordBridgePlugin(Plugin):
             sender.send_message("§cYou must be an operator to use this command.")
             return True
         try:
-            cfg_path = self.data_folder / "config.toml"
-            self._cfg = BridgeConfig.load(cfg_path)
-            if self.bot:
-                self.bot.plugin_config = self._cfg
+            self.reload_config_from_disk()
             sender.send_message("§aBridge config reloaded from disk.")
             self.logger.info(f"Config reloaded by {getattr(sender, 'name', 'console')}")
         except Exception as e:
@@ -543,7 +558,7 @@ class DiscordBridgePlugin(Plugin):
         self._queue_discord_message(name, msg, route, "chat", xuid)
 
         # Relay to child servers via Discord bridge_relay channel
-        if route == "relay" and self._cfg.channels.bridge_relay:
+        if route == "relay" and self._bridge_relay_enabled():
             self._post_to_bridge_relay(
                 self._cfg.relay_hub.server_name, name, msg
             )

@@ -4,6 +4,7 @@ from typing import Optional
 import discord
 from discord import app_commands
 
+from ..inventory_view import format_inventory_pages, snapshot_player_inventory
 from ..util import MinecraftCogBase, admin_only, allowlist_admin_only
 
 
@@ -42,6 +43,64 @@ class AdminCommands(MinecraftCogBase):
                 return (None, 7)  # Default to 7 days on error
 
     # -------- console execute & audit --------
+    @app_commands.command(name="inventory", description="Inspect an online player's inventory and Ender Chest.")
+    @admin_only()
+    @app_commands.describe(player="Exact name of the online Minecraft player")
+    async def inventory(self, interaction: discord.Interaction, player: str):
+        await self.safe_defer(interaction, ephemeral=True)
+
+        def capture():
+            target = self.plugin._online_player_obj(player)
+            return snapshot_player_inventory(target) if target is not None else None
+
+        try:
+            snapshot = await self._run_on_server_thread(capture)
+        except Exception as exc:
+            self.plugin.logger.error(f"Failed to inspect {player}'s inventory: {exc}")
+            await interaction.followup.send(
+                "❌ The inventory could not be read. Check the server log for details.",
+                ephemeral=True,
+            )
+            return
+
+        if snapshot is None:
+            await interaction.followup.send(
+                f"❌ **{discord.utils.escape_markdown(player)}** is not online.",
+                ephemeral=True,
+            )
+            return
+
+        pages = format_inventory_pages(snapshot)
+        player_name = snapshot["player"]
+        for index, description in enumerate(pages, start=1):
+            suffix = f" ({index}/{len(pages)})" if len(pages) > 1 else ""
+            embed = discord.Embed(
+                title=f"{player_name}'s Inventory{suffix}",
+                description=description,
+                color=0x5865F2,
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.set_footer(text="Live read-only snapshot • empty slots are omitted")
+            await interaction.followup.send(
+                embed=embed,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    @inventory.autocomplete("player")
+    async def inventory_player_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        try:
+            names = await self._run_on_server_thread(
+                lambda: sorted(p.name for p in self.server.online_players)
+            )
+        except Exception:
+            return []
+        query = current.casefold().strip()
+        matches = (name for name in names if query in name.casefold())
+        return [app_commands.Choice(name=name, value=name) for name in matches][:25]
+
     @app_commands.command(name="execute", description="Execute a Minecraft command on the server console.")
     @admin_only()
     @app_commands.describe(command_string="The command to run (e.g., 'summon pig 0 10 0')")
@@ -512,8 +571,7 @@ class AdminCommands(MinecraftCogBase):
                 old_container = self.plugin.config.grief_monitoring.track_container_access
 
                 # Reload the config from file
-                from ..config_schema import BridgeConfig
-                self.plugin.config = BridgeConfig.load(self.plugin.config_path)
+                self.plugin.reload_config_from_disk()
 
                 # Return comparison info
                 return {

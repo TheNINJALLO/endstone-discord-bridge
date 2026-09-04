@@ -7,7 +7,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 
-from .config_schema import BridgeConfig
+from .config_schema import BridgeConfig, is_bridge_relay_enabled
 from .cogs.guild_events import GuildEvents
 
 PRESENCE_MAP = {
@@ -195,7 +195,11 @@ class DiscordBot(commands.Bot):
     # ---------------- Discord -> MC relay ----------------
     async def on_message(self, message: discord.Message):
         # --- Bridge relay channel: child bot messages ---
-        bridge_relay_id = int(self.plugin_config.channels.bridge_relay or 0)
+        bridge_relay_id = (
+            int(self.plugin_config.channels.bridge_relay)
+            if is_bridge_relay_enabled(self.plugin_config)
+            else 0
+        )
         if bridge_relay_id and message.channel.id == bridge_relay_id and message.author.bot:
             # Check for RELAY embed from a child bot
             if message.embeds:

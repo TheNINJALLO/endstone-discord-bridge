@@ -8,6 +8,7 @@ webhook_url = ""
 webhook_avatar_template = "https://minotar.net/avatar/{name}.png"
 
 [features]
+bridge_relay = true
 relay_edits = false
 relay_deletes = false
 command_spy = false

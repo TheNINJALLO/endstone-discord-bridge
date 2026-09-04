@@ -59,14 +59,14 @@ Endstone ↔ Discord bridge. This release is aligned with Endstone 0.11.9 and Mi
 | Endstone API | `0.11` |
 | Bedrock Dedicated Server | `1.26.44` |
 | Python | `>=3.10` |
-| Plugin release | `v5.4.4` |
+| Plugin release | `v5.5.0` |
 
 ## Install
 
 Download the wheel from the matching GitHub release:
 
 ```bash
-gh release download v5.4.4 --repo TheNINJALLO/endstone-discord-bridge --pattern "*.whl"
+gh release download v5.5.0 --repo TheNINJALLO/endstone-discord-bridge --pattern "*.whl"
 ```
 
 Copy the downloaded wheel into the server's `plugins/` directory, remove any older wheel for the same plugin, and restart Endstone.
@@ -164,6 +164,7 @@ webhook_url = ""       # Optional: Webhook URL for webhook mode
 
 ```toml
 [features]
+bridge_relay = true         # Multi-server relay over the dedicated bridge_relay channel
 relay_edits = false          # Mirror Discord message edits to Minecraft
 relay_deletes = false        # Mirror Discord message deletes to Minecraft
 command_spy = false          # Log all player commands to Discord
@@ -174,6 +175,12 @@ list_dm_default = true      # Send /list results via DM by default
 activity_tracking = true    # Enable activity tracking
 grief_monitoring = true     # Enable grief monitoring system
 ```
+
+Set `bridge_relay = false` when this server does not use the dedicated Discord
+channel that transports chat between multiple Minecraft servers. This does not
+disable the normal Minecraft ↔ Discord chat channel, slash commands, status,
+audit, or other routed events. Setting `channels.bridge_relay = 0` also disables
+the channel-based multi-server bridge.
 
 ### Channels
 
@@ -285,6 +292,7 @@ track_member_events = true  # Track joins/leaves
 | Command | Description |
 |---------|-------------|
 | `/execute <command>` | Execute a Minecraft command on the server console |
+| `/inventory <player>` | Inspect an online player's inventory, equipment, offhand, and Ender Chest |
 | `/execute_when_online <player> <command> [notify]` | Queue a command to run when a player joins |
 | `/kick <player> [reason]` | Kick a player from the server |
 | `/ban <player> [reason]` | Ban a player from the server |

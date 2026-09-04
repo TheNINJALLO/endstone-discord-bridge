@@ -18,6 +18,7 @@ class DiscordSection:
 
 @dataclass
 class FeaturesSection:
+    bridge_relay: bool = True
     relay_edits: bool = True
     relay_deletes: bool = True
     command_spy: bool = False
@@ -255,3 +256,9 @@ class BridgeConfig:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(out, encoding="utf-8")
         tmp.replace(path)
+
+
+def is_bridge_relay_enabled(config: BridgeConfig) -> bool:
+    """Return whether the Discord-channel multi-server bridge is configured."""
+    enabled = getattr(config.features, "bridge_relay", True)
+    return bool(enabled and config.channels.bridge_relay)

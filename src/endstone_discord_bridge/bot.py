@@ -158,11 +158,13 @@ class DiscordBot(commands.Bot):
         from .cogs.status import ServerStatusCommands
         from .cogs.admin import AdminCommands
         from .cogs.activity import ActivityCommands
+        from .cogs.role_activity import RoleActivityCommands
 
         await self.add_cog(AccountLinkCommands(self))
         await self.add_cog(ServerStatusCommands(self))
         await self.add_cog(AdminCommands(self))
         await self.add_cog(ActivityCommands(self))
+        await self.add_cog(RoleActivityCommands(self))
         await self.add_cog(GuildEvents(self))
         
         try:

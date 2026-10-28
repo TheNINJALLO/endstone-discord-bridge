@@ -90,6 +90,7 @@ For commands with a `days` option, Discord limits the selection to `7`, `14`, or
 | `/activity <platform> <days>` | Shows aggregate activity statistics for `discord` or `minecraft`. | Example: `/activity platform:minecraft days:7`. |
 | `/activity_export <platform> <days>` | Exports Discord or Minecraft activity statistics as a downloadable text file. | Example: `/activity_export platform:discord days:30`. |
 | `/members [days] [show_inactive]` | Shows a comprehensive member report. Defaults to `30` days and hides inactive members. | Example: `/members days:14 show_inactive:true`. |
+| `/role_activity <role> [days] [include_logs]` | Searches retained Discord and Minecraft activity for every current member of the selected role, including offline members and members with no matching events. Defaults to `30` days; accepts `1`–`90`. Always attaches a member CSV; `include_logs:true` also attaches up to 10,000 matching event records, newest first. | Example: `/role_activity role:@Staff days:30 include_logs:true`. |
 | `/link_accounts <discord_user> <minecraft_username> [notes]` | Administratively links a Discord member to a Minecraft username, with optional notes. | Example: `/link_accounts discord_user:@Alex minecraft_username:Alex notes:Verified by staff`. |
 | `/unlink_accounts [discord_user] [minecraft_username]` | Removes an administrative account link. At least one of the two identifying options is required. | Example: `/unlink_accounts discord_user:@Alex`. |
 | `/linked_accounts` | Lists all administratively linked Discord and Minecraft accounts. | Run `/linked_accounts`. |
@@ -100,6 +101,37 @@ For commands with a `days` option, Discord limits the selection to `7`, `14`, or
 | `/daily_activity [days] [show_details]` | Shows a day-by-day activity report. Defaults to `14` days with detailed pages enabled. | Example: `/daily_activity days:7 show_details:false`. |
 | `/player_activity <player_name> [days]` | Shows activity for one Discord username or Minecraft player name. Defaults to `14` days. | Example: `/player_activity player_name:Alex days:30`. |
 | `/all_players_activity [platform] [days] [sort_by]` | Produces a paginated report for all players. Defaults to `both`, `14` days, sorted by `activity`; sorting can also use `name` or `last_seen`. | Example: `/all_players_activity platform:minecraft days:30 sort_by:last_seen`. |
+
+### Role activity matching
+
+`/role_activity` fetches the complete current Discord member list and searches the
+bridge's already loaded `discord.json` and `server.json` activity records. It works
+with retained events recorded before this command was installed. The selected
+role applies to membership at the time of the search; events may predate the role
+assignment. The CSV includes every member, event counts, last recorded activity,
+matched Minecraft names and UUIDs, and the matching method.
+
+Discord activity matches by Discord ID. For Minecraft, verified `/link` + `/verify`
+links and administrative `/link_accounts` links take priority. Unlinked members
+can match by their current Discord username, display name, nickname, or global
+name, using an exact case-insensitive comparison with retained player names.
+These name matches are marked **unverified** and do not create account links.
+Duplicate Discord names, reused Minecraft names, conflicting links, and names
+already linked elsewhere are flagged for review rather than assigned by guess.
+Use `/link_accounts` to resolve ambiguous names or different gamertags.
+
+The period counts events from the preceding `days` × 24 hours. Last-seen columns
+search all retained records. Retention and the enabled tracking switches limit
+the available results; no matching events means no matching *recorded* activity.
+Event exports contain recorded event types, timestamps, channel/world and
+location metadata where available. Reports use saved bridge events rather than
+Discord message contents. Existing records remain searchable when tracking is
+paused. The command requires Server Members Intent to fetch complete membership;
+see the [Discord member intent guide](https://discordpy.readthedocs.io/en/stable/intents.html#privileged-intents).
+
+Reports are private to the requesting administrator. Large attachments are gzip
+compressed automatically. Log exports explicitly show how many matching records
+were included; the member summary always covers the complete selected role.
 
 ## Child-server Chat Relay commands
 

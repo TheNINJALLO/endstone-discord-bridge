@@ -1,13 +1,48 @@
 import discord
 from discord import app_commands
 from typing import Literal
-import io
+import asyncio
+
+from ..activity_reports import report_files, send_report
 
 from ..util import MinecraftCogBase, admin_only
 
 
 class ActivityCommands(MinecraftCogBase):
     """Commands for viewing Discord and Minecraft activity statistics"""
+
+    async def _get_member_data(self, interaction, days, platform="both"):
+        guild = interaction.guild
+        if guild is None or not self.bot._is_primary_guild(guild):
+            await interaction.followup.send("Use this command in the bridge's configured Discord server.", ephemeral=True)
+            return None
+
+        async def fetch():
+            return [member async for member in guild.fetch_members(limit=None)]
+
+        try:
+            members = await asyncio.wait_for(fetch(), timeout=90)
+        except (discord.Forbidden, discord.ClientException):
+            await interaction.followup.send(
+                "Unable to read the complete member list. Enable Server Members Intent for the bot "
+                "in the Discord Developer Portal, then restart the bridge.", ephemeral=True)
+            return None
+        except asyncio.TimeoutError:
+            await interaction.followup.send("Fetching the complete member list timed out. Please retry shortly.", ephemeral=True)
+            return None
+        return self.plugin.activity_tracker.get_comprehensive_member_list(
+            days, discord_members=members, linked_accounts=dict(self.plugin.linked.links), platform=platform)
+
+    @staticmethod
+    def _member_name(member):
+        names = [member.get('discord_username') or member.get('discord_id'),
+                 member.get('minecraft_username') or member.get('minecraft_uuid')]
+        return " ↔ ".join(name for name in names if name) or member.get('discord_id') or member.get('minecraft_uuid') or 'Unknown'
+
+    @staticmethod
+    def _last_seen(member):
+        days = member.get('days_since_last_activity')
+        return f"{days}d ago" if days is not None else "No saved activity"
 
     @app_commands.command(name="activity", description="View activity statistics for Discord or Minecraft")
     @admin_only()
@@ -33,7 +68,11 @@ class ActivityCommands(MinecraftCogBase):
                 stats = activity_tracker.get_minecraft_stats(days)
                 embed = self._create_minecraft_stats_embed(stats, days)
             
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            member_data = await self._get_member_data(interaction, days, platform)
+            if member_data is None:
+                return
+            await send_report(interaction, [embed, self._create_inactive_members_embed(member_data, days)],
+                              filename=f"{platform}_activity_{days}d.txt")
             
         except Exception as e:
             self.plugin.logger.error(f"Error generating activity stats: {e}")
@@ -72,7 +111,7 @@ class ActivityCommands(MinecraftCogBase):
         # Most active users with linked account info
         if stats.most_active_users:
             top_users = []
-            for i, user in enumerate(stats.most_active_users[:5], 1):
+            for i, user in enumerate(stats.most_active_users, 1):
                 username = user['username']
                 count = user['count']
                 is_linked = user.get('is_linked', False)
@@ -86,7 +125,7 @@ class ActivityCommands(MinecraftCogBase):
                 top_users.append(f"{i}. **{display_name}** - {count:,} events")
 
             embed.add_field(
-                name="👑 Most Active Users",
+                name="👑 Active Users",
                 value="\n".join(top_users) if top_users else "No activity",
                 inline=False
             )
@@ -95,11 +134,11 @@ class ActivityCommands(MinecraftCogBase):
         if stats.daily_breakdown:
             daily_summary = []
             sorted_days = sorted(stats.daily_breakdown.items(), reverse=True)
-            for date, count in sorted_days[:7]:  # Show last 7 days
+            for date, count in sorted_days:
                 daily_summary.append(f"**{date}:** {count:,}")
             
             embed.add_field(
-                name="📅 Recent Daily Activity",
+                name="📅 Daily Activity",
                 value="\n".join(daily_summary) if daily_summary else "No recent activity",
                 inline=False
             )
@@ -150,7 +189,7 @@ class ActivityCommands(MinecraftCogBase):
         # Most active players with linked account info
         if stats.most_active_users:
             top_players = []
-            for i, player in enumerate(stats.most_active_users[:5], 1):
+            for i, player in enumerate(stats.most_active_users, 1):
                 username = player['username']
                 count = player['count']
                 is_linked = player.get('is_linked', False)
@@ -164,7 +203,7 @@ class ActivityCommands(MinecraftCogBase):
                 top_players.append(f"{i}. **{display_name}** - {count:,} events")
 
             embed.add_field(
-                name="👑 Most Active Players",
+                name="👑 Active Players",
                 value="\n".join(top_players) if top_players else "No activity",
                 inline=False
             )
@@ -173,11 +212,11 @@ class ActivityCommands(MinecraftCogBase):
         if stats.daily_breakdown:
             daily_summary = []
             sorted_days = sorted(stats.daily_breakdown.items(), reverse=True)
-            for date, count in sorted_days[:7]:  # Show last 7 days
+            for date, count in sorted_days:
                 daily_summary.append(f"**{date}:** {count:,}")
             
             embed.add_field(
-                name="📅 Recent Daily Activity",
+                name="📅 Daily Activity",
                 value="\n".join(daily_summary) if daily_summary else "No recent activity",
                 inline=False
             )
@@ -185,7 +224,7 @@ class ActivityCommands(MinecraftCogBase):
         embed.set_footer(text="Activity data is automatically cleaned up after 90 days")
         return embed
 
-    @app_commands.command(name="activity_export", description="Export raw activity data (admin only)")
+    @app_commands.command(name="activity_export", description="Export complete activity and inactive member lists (admin only)")
     @admin_only()
     @app_commands.describe(
         platform="Choose Discord or Minecraft activity",
@@ -211,19 +250,17 @@ class ActivityCommands(MinecraftCogBase):
                 filename = f"minecraft_activity_{days}d.txt"
                 content = self._format_minecraft_export(stats, days)
             
-            # Create a text file with the data
-            file_content = content.encode('utf-8')
-            file = discord.File(
-                fp=io.BytesIO(file_content),
-                filename=filename
-            )
-            
-            await interaction.followup.send(
-                f"📄 Activity export for {platform} ({days} days):",
-                file=file,
-                ephemeral=True
-            )
-            
+            member_data = await self._get_member_data(interaction, days, platform)
+            if member_data is None:
+                return
+            inactive = self._create_inactive_members_embed(member_data, days)
+            content += "\n\n" + "\n".join(field.name + "\n" + field.value for field in inactive.fields)
+            limit = getattr(interaction, "filesize_limit", None) or interaction.guild.filesize_limit
+            files = report_files(filename, content.encode('utf-8'), limit)
+            overview = (self._create_discord_stats_embed(stats, days) if platform == "discord"
+                        else self._create_minecraft_stats_embed(stats, days))
+            await send_report(interaction, [overview, inactive], files=files)
+
         except Exception as e:
             self.plugin.logger.error(f"Error exporting activity data: {e}")
             await interaction.followup.send(
@@ -249,10 +286,10 @@ class ActivityCommands(MinecraftCogBase):
             f"Messages: {stats.messages:,}",
             f"Voice Activity: {stats.voice_activity:,}",
             "",
-            "TOP USERS:",
+            "ALL ACTIVE USERS:",
         ]
         
-        for i, user in enumerate(stats.most_active_users[:10], 1):
+        for i, user in enumerate(stats.most_active_users, 1):
             lines.append(f"{i:2d}. {user['username']} - {user['count']:,} events")
         
         lines.extend(["", "DAILY BREAKDOWN:"])
@@ -278,10 +315,10 @@ class ActivityCommands(MinecraftCogBase):
             f"Leaves: {stats.leaves:,}",
             f"Completed Sessions: {min(stats.joins, stats.leaves):,}",
             "",
-            "TOP PLAYERS:",
+            "ALL ACTIVE PLAYERS:",
         ]
         
-        for i, player in enumerate(stats.most_active_users[:10], 1):
+        for i, player in enumerate(stats.most_active_users, 1):
             lines.append(f"{i:2d}. {player['username']} - {player['count']:,} events")
         
         lines.extend(["", "DAILY BREAKDOWN:"])
@@ -294,7 +331,7 @@ class ActivityCommands(MinecraftCogBase):
     @admin_only()
     @app_commands.describe(
         days="Number of days to analyze for recent activity (7, 14, or 30)",
-        show_inactive="Whether to show inactive members (default: False)"
+        show_inactive="Show the inactive list first (both complete lists are included)"
     )
     async def members(
         self,
@@ -305,15 +342,18 @@ class ActivityCommands(MinecraftCogBase):
         await self.safe_defer(interaction, ephemeral=True)
 
         try:
-            activity_tracker = self.plugin.activity_tracker
-            member_data = activity_tracker.get_comprehensive_member_list(days)
+            member_data = await self._get_member_data(interaction, days)
+            if member_data is None:
+                return
 
             if show_inactive:
                 embed = self._create_inactive_members_embed(member_data, days)
             else:
                 embed = self._create_active_members_embed(member_data, days)
 
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            other = (self._create_active_members_embed(member_data, days) if show_inactive
+                     else self._create_inactive_members_embed(member_data, days))
+            await send_report(interaction, [embed, other], filename=f"members_{days}d.txt")
 
         except Exception as e:
             self.plugin.logger.error(f"Error generating member list: {e}")
@@ -461,7 +501,7 @@ class ActivityCommands(MinecraftCogBase):
             )
 
             link_list = []
-            for i, link in enumerate(links[:20], 1):  # Limit to 20 to avoid embed limits
+            for i, link in enumerate(links, 1):
                 link_list.append(
                     f"{i}. **{link.discord_username}** ↔ **{link.minecraft_username}**"
                 )
@@ -472,15 +512,8 @@ class ActivityCommands(MinecraftCogBase):
                 inline=False
             )
 
-            if len(links) > 20:
-                embed.add_field(
-                    name="ℹ️ Note",
-                    value=f"Showing first 20 of {len(links)} total links",
-                    inline=False
-                )
-
             embed.set_footer(text="Use /unlink_accounts to remove links")
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await send_report(interaction, embed)
 
         except Exception as e:
             self.plugin.logger.error(f"Error viewing linked accounts: {e}")
@@ -516,20 +549,24 @@ class ActivityCommands(MinecraftCogBase):
             inline=True
         )
 
-        # Most active members
-        active_members = member_data['active_members'][:10]  # Top 10
+        # Complete active member list
+        active_members = member_data['active_members']
         if active_members:
             member_list = []
             for i, member in enumerate(active_members, 1):
-                name = member['discord_username'] or member['minecraft_username'] or 'Unknown'
-                total_events = member['discord_events_recent'] + member['minecraft_events_recent']
-                days_ago = member['days_since_last_activity']
+                name = self._member_name(member)
+                platform = member_data.get('platform', 'both')
+                sources = ('discord', 'minecraft') if platform == 'both' else (platform,)
+                total_events = sum(member[f'{source}_events_recent'] for source in sources)
+                last_seen = self._last_seen(member)
 
                 status = "🔗" if member['is_linked'] else ("💬" if member['discord_username'] else "⛏️")
-                member_list.append(f"{i}. {status} **{name}** - {total_events} events ({days_ago}d ago)")
+                counts = " · ".join(f"{source.title()}: {member[f'{source}_events_recent']:,}" for source in sources)
+                member_list.append(f"{i}. {status} **{name}** - {total_events} events "
+                                   f"({counts}; {member['active_days_count']} active days; {last_seen})")
 
             embed.add_field(
-                name="🏆 Most Active Members",
+                name="🏆 Active Members",
                 value="\n".join(member_list),
                 inline=False
             )
@@ -540,13 +577,14 @@ class ActivityCommands(MinecraftCogBase):
             inline=False
         )
 
-        embed.set_footer(text=f"Use '/members {days} true' to see inactive members")
+        embed.set_footer(text="Both complete member lists are included in this report.")
         return embed
 
     def _create_inactive_members_embed(self, member_data: dict, days: int) -> discord.Embed:
         """Create an embed for inactive members"""
         embed = discord.Embed(
-            title=f"😴 Inactive Members (>{days} days)",
+            title=f"😴 No Activity in the Last {days} Days",
+            description="Includes members with no saved activity. No saved records do not establish an inactivity duration.",
             color=0xFF6B6B,
             timestamp=discord.utils.utcnow()
         )
@@ -561,29 +599,25 @@ class ActivityCommands(MinecraftCogBase):
         )
 
         # Inactive members (sorted by last activity)
-        inactive_members = member_data['inactive_members'][:15]  # Top 15 most recently inactive
+        inactive_members = member_data['inactive_members']
         if inactive_members:
             member_list = []
             for i, member in enumerate(inactive_members, 1):
-                name = member['discord_username'] or member['minecraft_username'] or 'Unknown'
-                days_ago = member['days_since_last_activity']
-                total_events = member['total_discord_events'] + member['total_minecraft_events']
+                name = self._member_name(member)
+                last_seen = self._last_seen(member)
+                platform = member_data.get('platform', 'both')
+                sources = ('discord', 'minecraft') if platform == 'both' else (platform,)
+                total_events = sum(member[f'total_{source}_events'] for source in sources)
 
                 status = "🔗" if member['is_linked'] else ("💬" if member['discord_username'] else "⛏️")
-                member_list.append(f"{i}. {status} **{name}** - {days_ago}d ago ({total_events} total events)")
+                member_list.append(f"{i}. {status} **{name}** - {last_seen} ({total_events} total events)")
 
             embed.add_field(
-                name="😴 Inactive Members (Most Recent First)",
+                name="😴 Inactive Members / No Saved Activity (Most Recent First)",
                 value="\n".join(member_list),
                 inline=False
             )
 
-        if member_data['inactive_count'] > 15:
-            embed.add_field(
-                name="📝 Note",
-                value=f"Showing 15 of {member_data['inactive_count']} inactive members",
-                inline=False
-            )
 
         embed.add_field(
             name="ℹ️ Legend",
@@ -591,7 +625,7 @@ class ActivityCommands(MinecraftCogBase):
             inline=False
         )
 
-        embed.set_footer(text="Consider removing members inactive for 60+ days")
+        embed.set_footer(text="No saved activity means no retained records; it does not prove how long someone was inactive.")
         return embed
 
     @app_commands.command(name="inactive_members", description="List members inactive for a specific number of days")
@@ -616,22 +650,23 @@ class ActivityCommands(MinecraftCogBase):
             return
 
         try:
-            activity_tracker = self.plugin.activity_tracker
-            member_data = activity_tracker.get_comprehensive_member_list(90)  # Look at 90 days of data
+            member_data = await self._get_member_data(interaction, min_days, platform)
+            if member_data is None:
+                return
 
             # Filter inactive members by criteria
             filtered_inactive = []
             for member in member_data['inactive_members']:
-                if member['days_since_last_activity'] >= min_days:
+                if member['days_since_last_activity'] is None or member['days_since_last_activity'] >= min_days:
                     # Apply platform filter
-                    if platform == "discord" and not member['discord_username']:
+                    if platform == "discord" and not member['discord_id']:
                         continue
-                    elif platform == "minecraft" and not member['minecraft_username']:
+                    elif platform == "minecraft" and not member['minecraft_uuid']:
                         continue
                     filtered_inactive.append(member)
 
             embed = self._create_filtered_inactive_embed(filtered_inactive, min_days, platform)
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await send_report(interaction, embed)
 
         except Exception as e:
             self.plugin.logger.error(f"Error listing inactive members: {e}")
@@ -654,14 +689,19 @@ class ActivityCommands(MinecraftCogBase):
     ):
         await self.safe_defer(interaction, ephemeral=True)
 
+        if not 1 <= min_days <= 365:
+            await interaction.followup.send("Days must be between 1 and 365.", ephemeral=True)
+            return
+
         try:
-            activity_tracker = self.plugin.activity_tracker
-            member_data = activity_tracker.get_comprehensive_member_list(90)
+            member_data = await self._get_member_data(interaction, min_days)
+            if member_data is None:
+                return
 
             # Filter inactive members
             filtered_inactive = [
                 member for member in member_data['inactive_members']
-                if member['days_since_last_activity'] >= min_days
+                if member['days_since_last_activity'] is None or member['days_since_last_activity'] >= min_days
             ]
 
             if not filtered_inactive:
@@ -682,18 +722,10 @@ class ActivityCommands(MinecraftCogBase):
                 content = self._format_detailed_inactive_export(filtered_inactive, min_days)
                 filename = f"inactive_members_detailed_{min_days}d.txt"
 
-            # Create file
-            file_content = content.encode('utf-8')
-            file = discord.File(
-                fp=io.BytesIO(file_content),
-                filename=filename
-            )
-
-            await interaction.followup.send(
-                f"📄 Inactive members export ({len(filtered_inactive)} members, {min_days}+ days):",
-                file=file,
-                ephemeral=True
-            )
+            limit = getattr(interaction, "filesize_limit", None) or interaction.guild.filesize_limit
+            files = report_files(filename, content.encode('utf-8'), limit)
+            embed = self._create_filtered_inactive_embed(filtered_inactive, min_days, "both")
+            await send_report(interaction, embed, files=files)
 
         except Exception as e:
             self.plugin.logger.error(f"Error exporting inactive members: {e}")
@@ -705,7 +737,8 @@ class ActivityCommands(MinecraftCogBase):
     def _create_filtered_inactive_embed(self, inactive_members: list, min_days: int, platform: str) -> discord.Embed:
         """Create embed for filtered inactive members"""
         embed = discord.Embed(
-            title=f"😴 Inactive Members ({min_days}+ days)",
+            title=f"😴 Inactive Members / No Saved Activity ({min_days}+ days)",
+            description="Members with no retained records are labelled 'No saved activity'; their inactivity duration is unknown.",
             color=0xFF6B6B,
             timestamp=discord.utils.utcnow()
         )
@@ -720,26 +753,20 @@ class ActivityCommands(MinecraftCogBase):
 
         if inactive_members:
             member_list = []
-            for i, member in enumerate(inactive_members[:15], 1):  # Show top 15
-                name = member['discord_username'] or member['minecraft_username'] or 'Unknown'
-                days_ago = member['days_since_last_activity']
+            for i, member in enumerate(inactive_members, 1):
+                name = self._member_name(member)
+                last_seen = self._last_seen(member)
                 total_events = member['total_discord_events'] + member['total_minecraft_events']
 
                 status = "🔗" if member['is_linked'] else ("💬" if member['discord_username'] else "⛏️")
-                member_list.append(f"{i}. {status} **{name}** - {days_ago}d ago ({total_events} events)")
+                member_list.append(f"{i}. {status} **{name}** - {last_seen} ({total_events} events)")
 
             embed.add_field(
-                name="😴 Inactive Members",
+                name="😴 Inactive Members / No Saved Activity",
                 value="\n".join(member_list),
                 inline=False
             )
 
-            if len(inactive_members) > 15:
-                embed.add_field(
-                    name="📝 Note",
-                    value=f"Showing 15 of {len(inactive_members)} inactive members. Use /export_inactive for full list.",
-                    inline=False
-                )
         else:
             embed.add_field(
                 name="✅ No Results",
@@ -753,7 +780,7 @@ class ActivityCommands(MinecraftCogBase):
     def _format_discord_ids_export(self, inactive_members: list, min_days: int) -> str:
         """Format Discord IDs for bulk operations"""
         lines = [
-            f"Discord IDs - Inactive Members ({min_days}+ days)",
+            f"Discord IDs - Inactive Members / No Saved Activity ({min_days}+ days)",
             f"Generated: {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
             f"Total: {len(inactive_members)} members",
             "=" * 50,
@@ -772,7 +799,7 @@ class ActivityCommands(MinecraftCogBase):
     def _format_minecraft_names_export(self, inactive_members: list, min_days: int) -> str:
         """Format Minecraft usernames for bulk operations"""
         lines = [
-            f"Minecraft Usernames - Inactive Members ({min_days}+ days)",
+            f"Minecraft Usernames - Inactive Members / No Saved Activity ({min_days}+ days)",
             f"Generated: {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
             f"Total: {len(inactive_members)} members",
             "=" * 50,
@@ -791,7 +818,7 @@ class ActivityCommands(MinecraftCogBase):
     def _format_detailed_inactive_export(self, inactive_members: list, min_days: int) -> str:
         """Format detailed inactive member information"""
         lines = [
-            f"Detailed Inactive Members Report ({min_days}+ days)",
+            f"Detailed Inactive Members / No Saved Activity Report ({min_days}+ days)",
             f"Generated: {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
             f"Total: {len(inactive_members)} members",
             "=" * 80,
@@ -803,12 +830,12 @@ class ActivityCommands(MinecraftCogBase):
         for i, member in enumerate(inactive_members, 1):
             discord_name = member['discord_username'] or 'N/A'
             minecraft_name = member['minecraft_username'] or 'N/A'
-            days_inactive = member['days_since_last_activity']
+            days_inactive = self._last_seen(member)
             total_events = member['total_discord_events'] + member['total_minecraft_events']
             is_linked = 'Yes' if member['is_linked'] else 'No'
 
             lines.append(
-                f"{i:<3} {discord_name[:19]:<20} {minecraft_name[:19]:<20} {days_inactive:<15} {total_events:<15} {is_linked:<8}"
+                f"{i:<3} {discord_name:<20} {minecraft_name:<20} {days_inactive:<15} {total_events:<15} {is_linked:<8}"
             )
 
         lines.extend([
@@ -822,7 +849,7 @@ class ActivityCommands(MinecraftCogBase):
             f"- Linked accounts: {sum(1 for m in inactive_members if m['is_linked'])}",
             "",
             "RECOMMENDATIONS:",
-            "- Consider removing members inactive for 60+ days",
+            "- No saved activity means no retained records; it does not prove how long someone was inactive.",
             "- Review linked accounts before removal",
             "- Check with other admins before bulk operations"
         ])
@@ -846,7 +873,9 @@ class ActivityCommands(MinecraftCogBase):
             activity_tracker = self.plugin.activity_tracker
 
             # Get member data for 90 days to capture all inactive members
-            member_data = activity_tracker.get_comprehensive_member_list(90)
+            member_data = await self._get_member_data(interaction, 90, platform)
+            if member_data is None:
+                return
             # Combine active and inactive members to get all members
             all_members = member_data.get('active_members', []) + member_data.get('inactive_members', [])
 
@@ -858,13 +887,13 @@ class ActivityCommands(MinecraftCogBase):
                 days_inactive = member.get('days_since_last_activity', 0)
 
                 # Apply platform filter
-                if platform == "discord" and not member.get('discord_username'):
+                if platform == "discord" and not member.get('discord_id'):
                     continue
-                elif platform == "minecraft" and not member.get('minecraft_username'):
+                elif platform == "minecraft" and not member.get('minecraft_uuid'):
                     continue
 
                 for threshold in thresholds:
-                    if days_inactive >= threshold:
+                    if days_inactive is None or days_inactive >= threshold:
                         inactive_counts[threshold]['total'] += 1
                         if member.get('is_linked'):
                             inactive_counts[threshold]['linked'] += 1
@@ -875,7 +904,7 @@ class ActivityCommands(MinecraftCogBase):
                         inactive_counts[threshold]['members'].append(member)
 
             embed = self._create_inactivity_summary_embed(inactive_counts, platform, member_data['total_members'])
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await send_report(interaction, embed)
 
         except Exception as e:
             self.plugin.logger.error(f"Error generating inactivity summary: {e}")
@@ -888,7 +917,8 @@ class ActivityCommands(MinecraftCogBase):
         """Create embed showing inactivity summary for 7, 14, and 30 days"""
         embed = discord.Embed(
             title="😴 Inactivity Summary",
-            description=f"Overview of inactive members across different time periods\n**Platform Filter:** {platform.title()}",
+            description=f"Overview of inactive members across different time periods\n**Platform Filter:** {platform.title()}\n"
+                        "Members with no saved activity are included separately by label; their inactivity duration is unknown.",
             color=0xFF6B6B,
             timestamp=discord.utils.utcnow()
         )
@@ -920,24 +950,20 @@ class ActivityCommands(MinecraftCogBase):
                 inline=True
             )
 
-        # Show top 10 most inactive members (30+ days)
-        most_inactive = sorted(
-            inactive_counts[30]['members'],
-            key=lambda m: m.get('days_since_last_activity', 0),
-            reverse=True
-        )[:10]
-
-        if most_inactive:
+        # Every threshold includes its complete list, including unknown last seen.
+        for threshold in (7, 14, 30):
+            most_inactive = sorted(inactive_counts[threshold]['members'],
+                                   key=lambda m: m.get('days_since_last_activity') or 0, reverse=True)
             member_list = []
             for i, member in enumerate(most_inactive, 1):
-                name = member.get('discord_username') or member.get('minecraft_username') or 'Unknown'
-                days_ago = member.get('days_since_last_activity', 0)
+                name = self._member_name(member)
+                last_seen = self._last_seen(member)
                 status = "🔗" if member.get('is_linked') else ("💬" if member.get('discord_username') else "⛏️")
-                member_list.append(f"{i}. {status} **{name}** - {days_ago}d")
+                member_list.append(f"{i}. {status} **{name}** - {last_seen}")
 
             embed.add_field(
-                name="🏆 Most Inactive (30+ days)",
-                value="\n".join(member_list),
+                name=f"Inactive for {threshold}+ Days / No Saved Activity",
+                value="\n".join(member_list) or "No matching members.",
                 inline=False
             )
 
@@ -970,10 +996,14 @@ class ActivityCommands(MinecraftCogBase):
             minecraft_stats = activity_tracker.get_minecraft_stats(days)
 
             # Get comprehensive member data
-            member_data = activity_tracker.get_comprehensive_member_list(days)
+            member_data = await self._get_member_data(interaction, days)
+            if member_data is None:
+                return
 
             embed = self._create_unified_activity_embed(discord_stats, minecraft_stats, member_data, days)
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await send_report(interaction, [embed, self._create_active_members_embed(member_data, days),
+                                             self._create_inactive_members_embed(member_data, days)],
+                              filename=f"unified_activity_{days}d.txt")
 
         except Exception as e:
             self.plugin.logger.error(f"Error generating unified activity report: {e}")
@@ -1024,27 +1054,27 @@ class ActivityCommands(MinecraftCogBase):
             inline=True
         )
 
-        # Most active linked accounts
+        # Complete active linked accounts
         linked_activity = []
-        for member in member_data['active_members'][:10]:
+        for member in member_data['active_members']:
             if member['is_linked']:
                 discord_events = member['discord_events_recent']
                 minecraft_events = member['minecraft_events_recent']
-                total_events = discord_events + minecraft_events
+                linked_total = discord_events + minecraft_events
 
-                if total_events > 0:
+                if linked_total > 0:
                     linked_activity.append({
                         'discord_name': member['discord_username'],
                         'minecraft_name': member['minecraft_username'],
                         'discord_events': discord_events,
                         'minecraft_events': minecraft_events,
-                        'total_events': total_events
+                        'total_events': linked_total
                     })
 
         if linked_activity:
             linked_activity.sort(key=lambda x: x['total_events'], reverse=True)
             linked_list = []
-            for i, account in enumerate(linked_activity[:5], 1):
+            for i, account in enumerate(linked_activity, 1):
                 discord_name = account['discord_name'] or 'N/A'
                 minecraft_name = account['minecraft_name'] or 'N/A'
                 d_events = account['discord_events']
@@ -1057,7 +1087,7 @@ class ActivityCommands(MinecraftCogBase):
                 )
 
             embed.add_field(
-                name="🔗 Most Active Linked Accounts",
+                name="🔗 Active Linked Accounts",
                 value="\n".join(linked_list),
                 inline=False
             )
@@ -1096,7 +1126,7 @@ class ActivityCommands(MinecraftCogBase):
     @admin_only()
     @app_commands.describe(
         days="Number of days to analyze (7, 14, or 30)",
-        show_details="Show individual player details (may send multiple messages)"
+        show_details="Include complete individual player lists for every day"
     )
     async def daily_activity(
         self,
@@ -1110,24 +1140,14 @@ class ActivityCommands(MinecraftCogBase):
             activity_tracker = self.plugin.activity_tracker
             daily_data = activity_tracker.get_detailed_daily_activity(days)
 
-            # Send overview first
-            overview_embed = self._create_daily_overview_embed(daily_data, days)
-            await interaction.followup.send(embed=overview_embed, ephemeral=True)
-
+            embeds = [self._create_daily_overview_embed(daily_data, days)]
             if show_details:
-                # Send detailed breakdowns (may be multiple messages)
-                detail_embeds = self._create_daily_detail_embeds(daily_data, days)
-
-                for i, embed in enumerate(detail_embeds):
-                    if i == 0:
-                        continue  # Skip first as we already sent overview
-                    await interaction.followup.send(embed=embed, ephemeral=True)
-
-                if len(detail_embeds) > 1:
-                    await interaction.followup.send(
-                        f"📊 Daily activity breakdown complete ({len(detail_embeds)} messages sent)",
-                        ephemeral=True
-                    )
+                embeds.extend(self._create_daily_detail_embeds(daily_data, days))
+            member_data = await self._get_member_data(interaction, days)
+            if member_data is None:
+                return
+            embeds.append(self._create_inactive_members_embed(member_data, days))
+            await send_report(interaction, embeds, filename=f"daily_activity_{days}d.txt")
 
         except Exception as e:
             self.plugin.logger.error(f"Error generating daily activity: {e}")
@@ -1165,7 +1185,7 @@ class ActivityCommands(MinecraftCogBase):
                 return
 
             embed = self._create_player_activity_embed(player_data, player_name, days)
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await send_report(interaction, embed)
 
         except Exception as e:
             self.plugin.logger.error(f"Error generating player activity: {e}")
@@ -1250,18 +1270,18 @@ class ActivityCommands(MinecraftCogBase):
                 discord_users = day_data['unique_discord_users']
                 minecraft_players = day_data['unique_minecraft_players']
 
-                # Get most active users for this day
+                # List every active user for this day
                 top_discord = sorted(
                     day_data['discord_users'].items(),
                     key=lambda x: x[1]['events'],
                     reverse=True
-                )[:3]
+                )
 
                 top_minecraft = sorted(
                     day_data['minecraft_players'].items(),
                     key=lambda x: x[1]['events'],
                     reverse=True
-                )[:3]
+                )
 
                 day_summary = [
                     f"**Events:** 💬 {discord_events} | ⛏️ {minecraft_events}",
@@ -1270,11 +1290,11 @@ class ActivityCommands(MinecraftCogBase):
 
                 if top_discord:
                     discord_top = ", ".join([f"{user[1]['username']} ({user[1]['events']})" for user in top_discord])
-                    day_summary.append(f"**Top Discord:** {discord_top}")
+                    day_summary.append(f"**Discord members:** {discord_top}")
 
                 if top_minecraft:
                     minecraft_top = ", ".join([f"{user[1]['username']} ({user[1]['events']})" for user in top_minecraft])
-                    day_summary.append(f"**Top Minecraft:** {minecraft_top}")
+                    day_summary.append(f"**Minecraft players:** {minecraft_top}")
 
                 embed.add_field(
                     name=f"📅 {date}",
@@ -1372,11 +1392,11 @@ class ActivityCommands(MinecraftCogBase):
                 inline=True
             )
 
-        # Daily breakdown (last 7 days)
+        # Complete daily breakdown
         daily_breakdown = []
         sorted_dates = sorted(set(list(player_data['discord_data'].keys()) + list(player_data['minecraft_data'].keys())), reverse=True)
 
-        for date in sorted_dates[:7]:  # Show last 7 days
+        for date in sorted_dates:
             discord_events = player_data['discord_data'].get(date, {}).get('events', 0)
             minecraft_events = player_data['minecraft_data'].get(date, {}).get('events', 0)
             total_day = discord_events + minecraft_events
@@ -1386,7 +1406,7 @@ class ActivityCommands(MinecraftCogBase):
 
         if daily_breakdown:
             embed.add_field(
-                name="📅 Recent Daily Activity",
+                name="📅 Daily Activity",
                 value="\n".join(daily_breakdown),
                 inline=False
             )
@@ -1424,40 +1444,24 @@ class ActivityCommands(MinecraftCogBase):
         await self.safe_defer(interaction, ephemeral=True)
 
         try:
-            activity_tracker = self.plugin.activity_tracker
-            daily_data = activity_tracker.get_detailed_daily_activity(days)
-
-            # Collect all players from the daily data
-            all_players = self._collect_all_players_from_daily_data(daily_data, platform, days)
-
-            if not all_players:
-                await interaction.followup.send(
-                    f"❌ No players found with activity on {platform} in the last {days} days.",
-                    ephemeral=True
-                )
+            member_data = await self._get_member_data(interaction, days, platform)
+            if member_data is None:
                 return
-
-            # Sort players based on criteria
-            sorted_players = self._sort_players(all_players, sort_by)
-
-            # Create embeds (multiple messages due to player count)
-            embeds = self._create_all_players_embeds(sorted_players, platform, days, sort_by)
-
-            # Send all embeds
-            for i, embed in enumerate(embeds):
-                await interaction.followup.send(embed=embed, ephemeral=True)
-
-            # Send summary message
-            total_players = len(sorted_players)
-            total_messages = len(embeds)
-            await interaction.followup.send(
-                f"📊 **All Players Activity Report Complete**\n"
-                f"**Platform:** {platform.title()}\n"
-                f"**Period:** {days} days\n"
-                f"**Total Players:** {total_players}\n"
-                f"**Messages Sent:** {total_messages}",
-                ephemeral=True
-            )
+            if sort_by == "name":
+                key = lambda member: self._member_name(member).casefold()
+            elif sort_by == "last_seen":
+                key = lambda member: (member['days_since_last_activity'] is None,
+                                      member['days_since_last_activity'] or 0)
+            else:
+                sources = ("discord", "minecraft") if platform == "both" else (platform,)
+                key = lambda member: -sum(member[f'{source}_events_recent'] for source in sources)
+            for section in ('active_members', 'inactive_members'):
+                member_data[section].sort(key=key)
+            embeds = [self._create_active_members_embed(member_data, days),
+                      self._create_inactive_members_embed(member_data, days)]
+            embeds[0].title = f"All Players Activity - {platform.title()} ({days} days)"
+            embeds[0].description = f"Sorted by {sort_by.replace('_', ' ')}. Includes members with no saved activity."
+            await send_report(interaction, embeds, filename=f"all_players_{platform}_{days}d.txt")
 
         except Exception as e:
             self.plugin.logger.error(f"Error generating all players activity: {e}")
@@ -1465,224 +1469,3 @@ class ActivityCommands(MinecraftCogBase):
                 "❌ Failed to generate all players activity report. Check server logs for details.",
                 ephemeral=True
             )
-
-    def _collect_all_players_from_daily_data(self, daily_data, platform, days):
-        """Collect all players from daily data with their activity stats"""
-        all_players = {}
-
-        for date, day_data in daily_data.items():
-            # Process Discord users if requested
-            if platform in ["discord", "both"]:
-                for user_id, user_data in day_data['discord_users'].items():
-                    if user_id not in all_players:
-                        all_players[user_id] = {
-                            'id': user_id,
-                            'discord_username': user_data['username'],
-                            'minecraft_username': None,
-                            'platform': 'discord',
-                            'total_events': 0,
-                            'discord_events': 0,
-                            'minecraft_events': 0,
-                            'discord_messages': 0,
-                            'discord_joins': 0,
-                            'discord_voice': 0,
-                            'minecraft_joins': 0,
-                            'minecraft_leaves': 0,
-                            'last_activity_date': date,
-                            'active_days': set(),
-                            'daily_breakdown': {}
-                        }
-
-                    player = all_players[user_id]
-                    player['discord_username'] = user_data['username']  # Update to latest
-                    player['discord_events'] += user_data['events']
-                    player['total_events'] += user_data['events']
-                    player['discord_messages'] += user_data['messages']
-                    player['discord_joins'] += user_data['joins']
-                    player['discord_voice'] += user_data['voice_activity']
-                    player['active_days'].add(date)
-                    player['daily_breakdown'][date] = {
-                        'discord': user_data['events'],
-                        'minecraft': 0
-                    }
-
-                    # Update last activity date
-                    if date > player['last_activity_date']:
-                        player['last_activity_date'] = date
-
-            # Process Minecraft players if requested
-            if platform in ["minecraft", "both"]:
-                for player_uuid, player_data in day_data['minecraft_players'].items():
-                    # For minecraft-only view, use UUID as key
-                    # For both view, try to find if this player is linked to a Discord account
-                    player_key = player_uuid
-
-                    if platform == "both":
-                        # Check if this Minecraft player is linked to a Discord account
-                        activity_tracker = self.plugin.activity_tracker
-                        link = activity_tracker.get_admin_link_by_minecraft(player_uuid)
-                        if link:
-                            player_key = link.discord_id  # Use Discord ID as primary key for linked accounts
-
-                    if player_key not in all_players:
-                        all_players[player_key] = {
-                            'id': player_key,
-                            'discord_username': None,
-                            'minecraft_username': player_data['username'],
-                            'platform': 'minecraft',
-                            'total_events': 0,
-                            'discord_events': 0,
-                            'minecraft_events': 0,
-                            'discord_messages': 0,
-                            'discord_joins': 0,
-                            'discord_voice': 0,
-                            'minecraft_joins': 0,
-                            'minecraft_leaves': 0,
-                            'last_activity_date': date,
-                            'active_days': set(),
-                            'daily_breakdown': {}
-                        }
-
-                        # If this is a linked account, update Discord info
-                        if platform == "both" and player_key != player_uuid:
-                            activity_tracker = self.plugin.activity_tracker
-                            link = activity_tracker.get_admin_link_by_minecraft(player_uuid)
-                            if link:
-                                all_players[player_key]['discord_username'] = link.discord_username
-                                all_players[player_key]['platform'] = 'both'
-
-                    player = all_players[player_key]
-                    player['minecraft_username'] = player_data['username']  # Update to latest
-                    player['minecraft_events'] += player_data['events']
-                    player['total_events'] += player_data['events']
-                    player['minecraft_joins'] += player_data['joins']
-                    player['minecraft_leaves'] += player_data['leaves']
-                    player['active_days'].add(date)
-
-                    if date not in player['daily_breakdown']:
-                        player['daily_breakdown'][date] = {'discord': 0, 'minecraft': 0}
-                    player['daily_breakdown'][date]['minecraft'] += player_data['events']
-
-                    # Update last activity date
-                    if date > player['last_activity_date']:
-                        player['last_activity_date'] = date
-
-                    # Update platform if this player has both Discord and Minecraft activity
-                    if player['discord_events'] > 0 and player['minecraft_events'] > 0:
-                        player['platform'] = 'both'
-
-        # Convert active_days set to count
-        for player in all_players.values():
-            player['active_days_count'] = len(player['active_days'])
-            del player['active_days']  # Remove set for JSON compatibility
-
-        return list(all_players.values())
-
-    def _sort_players(self, players, sort_by):
-        """Sort players based on the specified criteria"""
-        if sort_by == "activity":
-            return sorted(players, key=lambda x: x['total_events'], reverse=True)
-        elif sort_by == "name":
-            return sorted(players, key=lambda x: (x['discord_username'] or x['minecraft_username'] or 'Unknown').lower())
-        elif sort_by == "last_seen":
-            return sorted(players, key=lambda x: x['last_activity_date'], reverse=True)
-        else:
-            return players
-
-    def _create_all_players_embeds(self, players, platform, days, sort_by):
-        """Create embeds for all players activity (multiple embeds due to player count)"""
-        embeds = []
-        players_per_embed = 15  # Limit to avoid Discord embed limits
-
-        total_players = len(players)
-        total_embeds = (total_players + players_per_embed - 1) // players_per_embed
-
-        for i in range(0, total_players, players_per_embed):
-            embed_players = players[i:i + players_per_embed]
-            embed_num = (i // players_per_embed) + 1
-
-            embed = discord.Embed(
-                title=f"👥 All Players Activity - {platform.title()} ({days} days)",
-                description=f"**Page {embed_num}/{total_embeds}** | Sorted by: {sort_by.replace('_', ' ').title()}",
-                color=0x3498DB,
-                timestamp=discord.utils.utcnow()
-            )
-
-            # Add summary for first embed
-            if embed_num == 1:
-                total_events = sum(p['total_events'] for p in players)
-                avg_events = total_events / len(players) if players else 0
-                most_active = players[0] if players else None
-
-                summary_lines = [
-                    f"**Total Players:** {total_players}",
-                    f"**Total Events:** {total_events:,}",
-                    f"**Average Events/Player:** {avg_events:.1f}"
-                ]
-
-                if most_active:
-                    most_active_name = most_active['discord_username'] or most_active['minecraft_username'] or 'Unknown'
-                    summary_lines.append(f"**Most Active:** {most_active_name} ({most_active['total_events']} events)")
-
-                embed.add_field(
-                    name="📊 Summary",
-                    value="\n".join(summary_lines),
-                    inline=False
-                )
-
-            # Add players to this embed
-            player_lines = []
-            for j, player in enumerate(embed_players, 1):
-                rank = i + j
-                discord_name = player['discord_username'] or 'N/A'
-                minecraft_name = player['minecraft_username'] or 'N/A'
-
-                # Determine display name and platform icon
-                if player['platform'] == 'both':
-                    display_name = f"{discord_name} ↔ {minecraft_name}"
-                    icon = "🔗"
-                elif player['platform'] == 'discord':
-                    display_name = discord_name
-                    icon = "💬"
-                else:  # minecraft
-                    display_name = minecraft_name
-                    icon = "⛏️"
-
-                # Activity breakdown
-                activity_parts = []
-                if platform in ["discord", "both"] and player['discord_events'] > 0:
-                    activity_parts.append(f"💬{player['discord_events']}")
-                if platform in ["minecraft", "both"] and player['minecraft_events'] > 0:
-                    activity_parts.append(f"⛏️{player['minecraft_events']}")
-
-                activity_str = " | ".join(activity_parts) if activity_parts else "No activity"
-
-                player_lines.append(
-                    f"{rank}. {icon} **{display_name}**\n"
-                    f"    📊 {player['total_events']} total | {activity_str} | 📅 {player['active_days_count']}d"
-                )
-
-            embed.add_field(
-                name=f"👥 Players {i+1}-{min(i+players_per_embed, total_players)}",
-                value="\n".join(player_lines),
-                inline=False
-            )
-
-            # Add legend
-            if platform == "both":
-                legend = "🔗 Linked Account | 💬 Discord Only | ⛏️ Minecraft Only"
-            elif platform == "discord":
-                legend = "💬 Discord Activity | 📊 Total Events | 📅 Active Days"
-            else:  # minecraft
-                legend = "⛏️ Minecraft Activity | 📊 Total Events | 📅 Active Days"
-
-            embed.add_field(
-                name="ℹ️ Legend",
-                value=legend,
-                inline=False
-            )
-
-            embed.set_footer(text=f"Page {embed_num}/{total_embeds} • {total_players} total players")
-            embeds.append(embed)
-
-        return embeds

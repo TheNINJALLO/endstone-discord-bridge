@@ -194,20 +194,22 @@ class ActivityTracker:
     
     def get_discord_stats(self, days: int) -> ActivityStats:
         """Get Discord activity statistics for the specified number of days"""
-        cutoff_time = time.time() - (days * 24 * 60 * 60)
+        now = time.time()
+        cutoff_time = now - (days * 24 * 60 * 60)
         recent_activity = [
             entry for entry in self.discord_activity 
-            if entry.timestamp > cutoff_time
+            if cutoff_time < entry.timestamp <= now
         ]
         
         return self._calculate_discord_stats(recent_activity, days)
     
     def get_minecraft_stats(self, days: int) -> ActivityStats:
         """Get Minecraft activity statistics for the specified number of days"""
-        cutoff_time = time.time() - (days * 24 * 60 * 60)
+        now = time.time()
+        cutoff_time = now - (days * 24 * 60 * 60)
         recent_activity = [
             entry for entry in self.minecraft_activity 
-            if entry.timestamp > cutoff_time
+            if cutoff_time < entry.timestamp <= now
         ]
         
         return self._calculate_minecraft_stats(recent_activity, days)
@@ -242,8 +244,9 @@ class ActivityTracker:
         
         # Enhanced most active users with linked account info
         enhanced_users = []
-        for user_id, count in sorted(user_activity.items(), key=lambda x: x[1], reverse=True)[:10]:
-            username = self._get_latest_username(user_id, activity)
+        names = {entry.user_id: entry.username for entry in sorted(activity, key=lambda e: e.timestamp)}
+        for user_id, count in sorted(user_activity.items(), key=lambda x: x[1], reverse=True):
+            username = names[user_id]
             link = self.get_admin_link_by_discord(user_id)
             user_data = {
                 "user_id": user_id,
@@ -287,8 +290,9 @@ class ActivityTracker:
         
         # Enhanced most active players with linked account info
         enhanced_players = []
-        for player_uuid, count in sorted(player_activity.items(), key=lambda x: x[1], reverse=True)[:10]:
-            username = self._get_latest_player_name(player_uuid, activity)
+        names = {entry.player_uuid: entry.player_name for entry in sorted(activity, key=lambda e: e.timestamp)}
+        for player_uuid, count in sorted(player_activity.items(), key=lambda x: x[1], reverse=True):
+            username = names[player_uuid]
             link = self.get_admin_link_by_minecraft(player_uuid)
             player_data = {
                 "user_id": player_uuid,
@@ -323,10 +327,12 @@ class ActivityTracker:
     def _get_daily_breakdown(self, activity: List, days: int) -> Dict[str, int]:
         """Get daily breakdown of activity"""
         daily_counts = {}
+        now = datetime.fromtimestamp(time.time(), timezone.utc)
         
         # Initialize all days with 0
-        for i in range(days):
-            date = datetime.now(timezone.utc) - timedelta(days=i)
+        # A rolling N-day window can cover parts of N+1 UTC calendar days.
+        for i in range(days + 1):
+            date = now - timedelta(days=i)
             date_str = date.strftime("%Y-%m-%d")
             daily_counts[date_str] = 0
         
@@ -389,146 +395,127 @@ class ActivityTracker:
         """Get all admin links"""
         return self.admin_links.copy()
 
-    def get_comprehensive_member_list(self, days: int = 30) -> Dict[str, Any]:
-        """Get comprehensive list of all members with activity data"""
-        cutoff_time = time.time() - (days * 24 * 60 * 60)
+    def get_comprehensive_member_list(self, days=30, *, discord_members=(), linked_accounts=None, platform="both"):
+        """Include the complete guild roster, known players and accounts without events.
 
-        # Get recent activity
-        recent_discord = [e for e in self.discord_activity if e.timestamp > cutoff_time]
-        recent_minecraft = [e for e in self.minecraft_activity if e.timestamp > cutoff_time]
-
-        # Track all users
+        No saved activity is distinct from a measured number of inactive days.
+        Platform filters determine both recent activity and last seen.
+        """
+        now = time.time()
+        cutoff = now - days * 86400
+        discord_members = tuple(discord_members)
         all_members = {}
+        owners = {}
+        for uuid, uid in (linked_accounts or {}).items():
+            owners.setdefault(str(uuid), set()).add(str(uid))
+        for link in self.admin_links:
+            owners.setdefault(str(link.minecraft_uuid), set()).add(str(link.discord_id))
+        links = {uuid: next(iter(ids)) for uuid, ids in owners.items() if len(ids) == 1}
 
-        # Process Discord activity
-        for entry in self.discord_activity:
-            user_id = entry.user_id
-            if user_id not in all_members:
-                all_members[user_id] = {
-                    'discord_id': user_id,
-                    'discord_username': entry.username,
-                    'minecraft_uuid': None,
-                    'minecraft_username': None,
-                    'last_discord_activity': entry.timestamp,
-                    'last_minecraft_activity': None,
-                    'discord_events_recent': 0,
-                    'minecraft_events_recent': 0,
-                    'total_discord_events': 0,
-                    'total_minecraft_events': 0,
-                    'is_linked': False,
-                    'link_type': None,
-                    'days_since_last_activity': 0
+        def member(key, uid=None, uuid=None):
+            if key not in all_members:
+                all_members[key] = {
+                    'discord_id': uid, 'discord_username': None,
+                    'minecraft_uuid': uuid, 'minecraft_username': None,
+                    'last_discord_activity': None, 'last_minecraft_activity': None,
+                    'discord_events_recent': 0, 'minecraft_events_recent': 0,
+                    'total_discord_events': 0, 'total_minecraft_events': 0,
+                    'is_linked': False, 'link_type': None,
+                    'days_since_last_activity': None,
+                    'discord_active_days': set(), 'minecraft_active_days': set(),
                 }
-            else:
-                all_members[user_id]['last_discord_activity'] = max(
-                    all_members[user_id]['last_discord_activity'], entry.timestamp
-                )
-                all_members[user_id]['discord_username'] = entry.username  # Update to latest
+            return all_members[key]
 
-            all_members[user_id]['total_discord_events'] += 1
-            if entry.timestamp > cutoff_time:
-                all_members[user_id]['discord_events_recent'] += 1
+        for current in discord_members:
+            uid = str(current.id)
+            member(uid, uid=uid)['discord_username'] = current.name
+        for uuid, uid in links.items():
+            row = member(uid, uid=uid)
+            row['minecraft_uuid'] = uuid
+            row['is_linked'] = True
+            row['link_type'] = 'account link'
+        for link in self.admin_links:
+            if links.get(str(link.minecraft_uuid)) == str(link.discord_id):
+                row = member(str(link.discord_id), uid=str(link.discord_id))
+                row['discord_username'] = row['discord_username'] or link.discord_username
+                row['minecraft_username'] = link.minecraft_username
 
-        # Process Minecraft activity
+        for entry in self.discord_activity:
+            if entry.timestamp > now:
+                continue
+            uid = str(entry.user_id)
+            row = member(uid, uid=uid)
+            if entry.timestamp >= (row['last_discord_activity'] or 0):
+                row['discord_username'] = entry.username
+                row['last_discord_activity'] = entry.timestamp
+            row['total_discord_events'] += 1
+            row['discord_events_recent'] += entry.timestamp > cutoff
+            if entry.timestamp > cutoff:
+                row['discord_active_days'].add(datetime.fromtimestamp(entry.timestamp, timezone.utc).date())
         for entry in self.minecraft_activity:
-            uuid = entry.player_uuid
-            # Find if this player is linked via admin links
-            linked_discord = None
-            for link in self.admin_links:
-                if link.minecraft_uuid == uuid:
-                    linked_discord = link.discord_id
-                    break
+            if entry.timestamp > now:
+                continue
+            uuid = str(entry.player_uuid)
+            uid = links.get(uuid)
+            row = member(uid or f"mc_{uuid}", uid=uid, uuid=uuid)
+            row['minecraft_uuid'] = row['minecraft_uuid'] or uuid
+            if entry.timestamp >= (row['last_minecraft_activity'] or 0):
+                row['minecraft_username'] = entry.player_name
+                row['last_minecraft_activity'] = entry.timestamp
+            row['total_minecraft_events'] += 1
+            row['minecraft_events_recent'] += entry.timestamp > cutoff
+            if entry.timestamp > cutoff:
+                row['minecraft_active_days'].add(datetime.fromtimestamp(entry.timestamp, timezone.utc).date())
 
-            if linked_discord and linked_discord in all_members:
-                # Update existing Discord member with Minecraft data
-                member = all_members[linked_discord]
-                member['minecraft_uuid'] = uuid
-                member['minecraft_username'] = entry.player_name
-                member['is_linked'] = True
-                member['link_type'] = 'admin'
-                if member['last_minecraft_activity'] is None:
-                    member['last_minecraft_activity'] = entry.timestamp
-                else:
-                    member['last_minecraft_activity'] = max(
-                        member['last_minecraft_activity'], entry.timestamp
-                    )
-                member['total_minecraft_events'] += 1
-                if entry.timestamp > cutoff_time:
-                    member['minecraft_events_recent'] += 1
-            else:
-                # Create new entry for Minecraft-only player
-                member_key = f"mc_{uuid}"
-                if member_key not in all_members:
-                    all_members[member_key] = {
-                        'discord_id': None,
-                        'discord_username': None,
-                        'minecraft_uuid': uuid,
-                        'minecraft_username': entry.player_name,
-                        'last_discord_activity': None,
-                        'last_minecraft_activity': entry.timestamp,
-                        'discord_events_recent': 0,
-                        'minecraft_events_recent': 0,
-                        'total_discord_events': 0,
-                        'total_minecraft_events': 0,
-                        'is_linked': False,
-                        'link_type': None,
-                        'days_since_last_activity': 0
-                    }
-                else:
-                    all_members[member_key]['last_minecraft_activity'] = max(
-                        all_members[member_key]['last_minecraft_activity'], entry.timestamp
-                    )
-                    all_members[member_key]['minecraft_username'] = entry.player_name
-
-                all_members[member_key]['total_minecraft_events'] += 1
-                if entry.timestamp > cutoff_time:
-                    all_members[member_key]['minecraft_events_recent'] += 1
-
-        # Calculate days since last activity and categorize
-        current_time = time.time()
-        active_members = []
-        inactive_members = []
-
-        for member in all_members.values():
-            last_activity = max(
-                member['last_discord_activity'] or 0,
-                member['last_minecraft_activity'] or 0
-            )
-            member['days_since_last_activity'] = int((current_time - last_activity) / (24 * 60 * 60))
-
-            if member['days_since_last_activity'] <= days:
-                active_members.append(member)
-            else:
-                inactive_members.append(member)
-
-        # Sort by last activity (most recent first)
-        active_members.sort(key=lambda x: max(x['last_discord_activity'] or 0, x['last_minecraft_activity'] or 0), reverse=True)
-        inactive_members.sort(key=lambda x: max(x['last_discord_activity'] or 0, x['last_minecraft_activity'] or 0), reverse=True)
-
+        # Prefer the current Discord name to historical event names.
+        for current in discord_members:
+            all_members[str(current.id)]['discord_username'] = current.name
+        active, inactive = [], []
+        for row in all_members.values():
+            if platform == "discord" and not row['discord_id']:
+                continue
+            if platform == "minecraft" and not row['minecraft_uuid']:
+                continue
+            timestamps = []
+            recent = 0
+            for source in ("discord", "minecraft") if platform == "both" else (platform,):
+                timestamps.append(row[f'last_{source}_activity'] or 0)
+                recent += row[f'{source}_events_recent']
+            last = max(timestamps)
+            row['days_since_last_activity'] = int((now - last) / 86400) if last else None
+            sources = ('discord', 'minecraft') if platform == 'both' else (platform,)
+            row['active_days_count'] = len(set().union(*(row[f'{source}_active_days'] for source in sources)))
+            del row['discord_active_days'], row['minecraft_active_days']
+            (active if recent else inactive).append(row)
+        order = lambda row: (row['days_since_last_activity'] is None,
+                             row['days_since_last_activity'] or 0,
+                             (row['discord_username'] or row['minecraft_username'] or '').casefold())
+        active.sort(key=order)
+        inactive.sort(key=order)
+        rows = active + inactive
         return {
-            'active_members': active_members,
-            'inactive_members': inactive_members,
-            'total_members': len(all_members),
-            'active_count': len(active_members),
-            'inactive_count': len(inactive_members),
-            'linked_count': sum(1 for m in all_members.values() if m['is_linked']),
-            'discord_only': sum(1 for m in all_members.values() if m['discord_id'] and not m['minecraft_uuid']),
-            'minecraft_only': sum(1 for m in all_members.values() if m['minecraft_uuid'] and not m['discord_id']),
-            'analysis_period_days': days
+            'active_members': active, 'inactive_members': inactive,
+            'total_members': len(rows), 'active_count': len(active), 'inactive_count': len(inactive),
+            'linked_count': sum(row['is_linked'] for row in rows),
+            'discord_only': sum(bool(row['discord_id'] and not row['minecraft_uuid']) for row in rows),
+            'minecraft_only': sum(bool(row['minecraft_uuid'] and not row['discord_id']) for row in rows),
+            'analysis_period_days': days,
+            'platform': platform,
         }
 
     def get_detailed_daily_activity(self, days: int = 30) -> Dict[str, Any]:
         """Get detailed daily activity breakdown for all players"""
-        cutoff_time = time.time() - (days * 24 * 60 * 60)
+        now = time.time()
+        cutoff_time = now - (days * 24 * 60 * 60)
 
         # Get recent activity
-        recent_discord = [e for e in self.discord_activity if e.timestamp > cutoff_time]
-        recent_minecraft = [e for e in self.minecraft_activity if e.timestamp > cutoff_time]
+        recent_discord = [e for e in self.discord_activity if cutoff_time < e.timestamp <= now]
+        recent_minecraft = [e for e in self.minecraft_activity if cutoff_time < e.timestamp <= now]
 
         # Initialize daily data structure
         daily_data = {}
-        for i in range(days):
-            date = datetime.now(timezone.utc) - timedelta(days=i)
+        for i in range(days + 1):
+            date = datetime.fromtimestamp(now, timezone.utc) - timedelta(days=i)
             date_str = date.strftime("%Y-%m-%d")
             daily_data[date_str] = {
                 'discord_users': {},

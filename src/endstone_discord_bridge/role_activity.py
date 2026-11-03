@@ -54,14 +54,14 @@ def _name(value):
 
 def build_role_report(members, role_member_ids, discord_activity, minecraft_activity,
                       admin_links=(), linked_accounts=None, *, days=30, now=None,
-                      include_logs=False, max_log_rows=10000):
+                      include_logs=False, max_log_rows=None):
     """Build shared log indexes; resolve stable links before name matches.
 
     ``members`` includes the entire guild so a duplicate nickname outside the role
     cannot silently give its Minecraft activity to someone inside the role.
     Inputs are snapshots; no links or saved activity are changed by this report.
     """
-    if not 1 <= days <= 90 or max_log_rows < 1:
+    if not 1 <= days <= 90 or max_log_rows is not None and max_log_rows < 1:
         raise ValueError("Use 1–90 days and a positive log limit")
     now = time.time() if now is None else now
     cutoff = now - days * 86400
@@ -157,7 +157,9 @@ def build_role_report(members, role_member_ids, discord_activity, minecraft_acti
                event.event_type, getattr(event, "channel_name", "") or getattr(event, "world", "") or "",
                getattr(event, "coordinates", "") or "", row.match if platform == "minecraft" else "Discord ID")
         item = (event.timestamp, report.log_count, log)
-        if len(log_heap) < max_log_rows:
+        if max_log_rows is None:
+            log_heap.append(item)
+        elif len(log_heap) < max_log_rows:
             heapq.heappush(log_heap, item)
         elif item[:2] > log_heap[0][:2]:
             heapq.heapreplace(log_heap, item)
@@ -209,10 +211,11 @@ def summary_csv(report):
     return _csv_bytes(
         ("discord_id", "username", "display_name", "minecraft_names", "minecraft_uuids", "match", "notes",
          "discord_events", "minecraft_events", "messages", "voice_events", "minecraft_joins", "minecraft_leaves",
-         "last_discord_utc", "last_minecraft_utc"),
+         "last_discord_utc", "last_minecraft_utc", "activity_status"),
         ((r.member.discord_id, r.member.username, r.member.display_name, "; ".join(r.minecraft_names),
           "; ".join(r.minecraft_uuids), r.match, r.notes, r.discord_events, r.minecraft_events, r.messages,
-          r.voice_events, r.joins, r.leaves, utc_timestamp(r.last_discord), utc_timestamp(r.last_minecraft))
+          r.voice_events, r.joins, r.leaves, utc_timestamp(r.last_discord), utc_timestamp(r.last_minecraft),
+          "active" if r.total_events else "inactive")
          for r in report.rows),
     )
 

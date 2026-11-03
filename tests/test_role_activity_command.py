@@ -7,6 +7,7 @@ import discord
 import pytest
 
 from endstone_discord_bridge.activity_tracker import DiscordActivityEntry
+from endstone_discord_bridge.activity_reports import report_pages
 from endstone_discord_bridge.cogs.role_activity import RoleActivityCommands
 from endstone_discord_bridge.role_activity import RoleMember, build_role_report
 
@@ -109,8 +110,48 @@ def test_embed_stays_within_discord_limits_and_does_not_ping_names():
     members = [RoleMember(str(i), "user", "@everyone" + "*" * 1000) for i in range(20)]
     events = [DiscordActivityEntry(str(i), "old", "message", 100) for i in range(20)]
     result = build_role_report(members, [m.discord_id for m in members], events, [], now=101)
-    embed = RoleActivityCommands._report_embed(SimpleNamespace(name="x" * 500), result, False)
-    assert len(embed.title) <= 256
-    assert all(len(f.value) <= 1024 for f in embed.fields)
-    assert len(embed) <= 6000
-    assert "@everyone" not in embed.fields[0].value
+    pages = report_pages([RoleActivityCommands._report_embed(SimpleNamespace(name="x" * 500), result, False)])
+    for embed in pages:
+        assert len(embed.title) <= 256
+        assert all(len(f.value) <= 1024 for f in embed.fields)
+        assert len(embed) <= 6000
+        assert all("@everyone" not in field.value for field in embed.fields)
+    text = "\n".join(f.value for embed in pages for f in embed.fields)
+    assert all(f"({i})" in text for i in range(20))
+
+
+def test_role_search_pages_and_download_include_every_active_and_inactive_member():
+    async def run():
+        cog, interaction, role, calls = setup_command()
+        interaction.user = SimpleNamespace(id=987)
+
+        async def fetch_members(**kwargs):
+            calls.append(kwargs)
+            for i in range(260):
+                yield SimpleNamespace(id=i + 1000, name=f'Member{i:03d}', display_name=f'Member{i:03d}',
+                                      nick=None, global_name=None, roles=[role])
+
+        interaction.guild.fetch_members = fetch_members
+        import time
+        cog.plugin.activity_tracker.discord_activity = [
+            DiscordActivityEntry(str(i + 1000), f'Member{i:03d}', 'message', time.time()) for i in range(130)
+        ]
+        await RoleActivityCommands.role_activity.callback(cog, interaction, role, days=30)
+        sent = interaction.followup.send.call_args.kwargs
+        assert calls == [{'limit': None}]
+        assert '130 active' in sent['embed'].description
+        assert '130 inactive' in sent['embed'].description
+        view = sent['view']
+        assert view is not None and view.page_count > 1
+        text = '\n'.join(f.value for page in view.pages for f in page.fields)
+        assert all(f'Member{i:03d}' in text for i in range(260))
+        csv = sent['files'][0].fp.getvalue().decode('utf-8-sig')
+        assert all(f'Member{i:03d}' in csv for i in range(260))
+        assert csv.count(',active\r\n') == csv.count(',inactive\r\n') == 130
+        page_interaction = SimpleNamespace(response=SimpleNamespace(edit_message=AsyncMock()))
+        for index in range(view.page_count):
+            await view._move(page_interaction, index)
+            assert page_interaction.response.edit_message.call_args.kwargs['embed'].fields
+        view.stop()
+
+    asyncio.run(run())

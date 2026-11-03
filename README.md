@@ -327,16 +327,22 @@ track_member_events = true  # Track joins/leaves
 | Command | Description |
 |---------|-------------|
 | `/activity <platform> [days]` | View activity statistics for Discord or Minecraft |
-| `/members [days] [show_inactive]` | View comprehensive member list with activity data |
-| `/role_activity <role> [days] [include_logs]` | Cross-reference current role members with saved Discord and Minecraft activity; download a CSV and optional matching event logs |
+| `/members [days] [show_inactive]` | View complete active and inactive member lists; `show_inactive` puts the inactive list first |
+| `/role_activity <role> [days] [include_logs]` | View every current role member in active and inactive lists, with a full CSV and optional complete matching logs |
+| `/activity_export <platform> [days]` | Download every active user/player and inactive member for the selected platform |
 | `/unified_activity [days]` | View combined Discord + Minecraft activity report |
 | `/daily_activity [days] [show_details]` | View detailed daily activity breakdown |
 | `/all_players_activity [platform] [days] [sort_by]` | View activity for all players |
 | `/inactive_members [min_days]` | List inactive members |
+| `/inactivity_summary [platform]` | View complete inactive lists for 7, 14, and 30 days |
 | `/export_inactive [min_days] [format]` | Export inactive member list |
 | `/link_accounts <discord_user> <minecraft_username>` | Manually link accounts (admin) |
 | `/unlink_accounts [discord_user] [minecraft_username]` | Unlink accounts (admin) |
 | `/linked_accounts` | View all linked accounts |
+
+Activity reports use **First / Previous / Next / Last** buttons to show every entry within Discord's message limits. A complete download is attached automatically; large downloads are compressed or split into numbered files. If there are more than ten files, continue through the pages to download the remaining parts. Page controls last 14 minutes; the attached downloads remain available.
+
+Member reports fetch the complete Discord member roster, including members who have never generated a saved event, and include known Minecraft players and linked accounts. Platform filters use activity on the selected platform. **No saved activity** means the bridge has no retained records for that account; it does not establish an inactivity duration. Minecraft players can only be identified from retained records or account links. Role reports use current role membership and keep name-match warnings visible. `include_logs=true` attaches every matching retained event in the selected period.
 
 ### Admin Commands - Configuration
 

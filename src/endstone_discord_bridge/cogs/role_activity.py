@@ -1,11 +1,10 @@
 import asyncio
-import gzip
-import io
 
 import discord
 from discord import app_commands
 
 from ..role_activity import RoleMember, build_role_report, logs_csv, summary_csv
+from ..activity_reports import report_files, send_report
 from ..util import MinecraftCogBase, admin_only
 
 
@@ -18,7 +17,7 @@ class RoleActivityCommands(MinecraftCogBase):
     @app_commands.describe(
         role="Role whose current members should be included",
         days="Days of saved activity to search (1–90, default 30)",
-        include_logs="Also attach the latest matching event records (up to 10,000)",
+        include_logs="Also attach all matching saved event records for the selected period",
     )
     async def role_activity(self, interaction: discord.Interaction, role: discord.Role,
                             days: app_commands.Range[int, 1, 90] = 30, include_logs: bool = False):
@@ -51,8 +50,7 @@ class RoleActivityCommands(MinecraftCogBase):
             if not self.plugin.config.activity.enabled:
                 embed.add_field(name="Tracking paused", value="Activity tracking is disabled; this report uses saved records.",
                                 inline=False)
-            await interaction.followup.send(embed=embed, files=files, ephemeral=True,
-                                            allowed_mentions=discord.AllowedMentions.none())
+            await send_report(interaction, embed, files=files)
         except (discord.Forbidden, discord.ClientException):
             await interaction.followup.send(
                 "Unable to read the complete role membership. Enable Server Members Intent for the bot "
@@ -75,12 +73,7 @@ class RoleActivityCommands(MinecraftCogBase):
             attachments.append((f"role_{role_id}_logs.csv", logs_csv(report)))
         files = []
         for name, data in attachments:
-            if len(data) > file_limit:
-                data = gzip.compress(data, mtime=0)
-                name += ".gz"
-            if len(data) > file_limit:
-                raise ValueError("The report exceeds Discord's attachment limit. Choose a shorter period or a smaller role.")
-            files.append(discord.File(io.BytesIO(data), filename=name))
+            files.extend(report_files(name, data, file_limit))
         return report, files
 
     @staticmethod
@@ -90,19 +83,26 @@ class RoleActivityCommands(MinecraftCogBase):
                               timestamp=discord.utils.utcnow())
         embed.description = (
             f"**{len(report.rows):,} current role members** · {report.days} days\n"
-            f"**{active:,}** with matching activity · **{len(report.rows) - active:,}** with no matching events\n"
+            f"**{active:,} active** · **{len(report.rows) - active:,} inactive** (no matching recorded events)\n"
             f"**{sum(r.discord_events for r in report.rows):,}** Discord events · "
             f"**{sum(r.minecraft_events for r in report.rows):,}** Minecraft events\n\n"
             "The CSV includes every current role member, counts, matching method and last recorded activity. "
             "Account links take priority; name matches are unverified. Ambiguous names are flagged."
         )
-        if report.rows:
-            preview = []
-            for row in report.rows[:8]:
-                name = discord.utils.escape_markdown(discord.utils.escape_mentions(row.member.display_name[:60]))
-                preview.append(f"**{name}** — Discord {row.discord_events:,} · Minecraft {row.minecraft_events:,}"
-                               + (" · review match" if row.notes else ""))
-            embed.add_field(name="Member preview", value="\n".join(preview)[:1024], inline=False)
+        for active_group, label in ((True, "Active members"), (False, "Inactive members (no matching recorded events)")):
+            lines = []
+            for row in report.rows:
+                if bool(row.total_events) != active_group:
+                    continue
+                name = discord.utils.escape_markdown(discord.utils.escape_mentions(row.member.display_name))
+                minecraft = ", ".join(row.minecraft_names)
+                identity = f" · Minecraft: {discord.utils.escape_markdown(minecraft)}" if minecraft else ""
+                lines.append(f"**{name}** ({row.member.discord_id}){identity} — "
+                             f"Discord {row.discord_events:,} · Minecraft {row.minecraft_events:,}"
+                             + (f" · {row.notes}" if row.notes else ""))
+            if lines:
+                # send_report splits complete fields into Discord-safe pages.
+                embed.add_field(name=f"{label} ({len(lines):,})", value="\n".join(lines), inline=False)
         if include_logs:
             embed.add_field(name="Matching event log", value=f"{len(report.logs):,} of {report.log_count:,} records attached, newest first.",
                             inline=False)

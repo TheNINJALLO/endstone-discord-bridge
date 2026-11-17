@@ -21,7 +21,7 @@ class ChatRelayPlugin(Plugin):
     api_version = "0.11"
 
     name = "ChatRelay"
-    version = "1.2.2"
+    version = "1.2.3"
     description = "Relay chat between child servers and the main bridge via Discord."
 
     commands = {
